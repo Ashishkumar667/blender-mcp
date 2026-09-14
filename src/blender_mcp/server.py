@@ -255,17 +255,16 @@ _agent_links: Dict[str, "AgentLink"] = {}
 _agent_links_guard = threading.Lock()
 
 AGENT_POLL_TIMEOUT = 15.0  # how long internal_blender_agent_poll waits before returning "no command"
-AGENT_RESULT_TTL = 600.0  # how long a completed-but-unretrieved result is kept for check_blender_result
 
 # Hosted platforms commonly put their own gateway timeout (e.g. an nginx/APISIX
-# reverse proxy) in front of a single request. Relying on the model to follow
-# up with check_blender_result turned out not to be reliable in practice, so
-# this is sized to let a call finish synchronously in the vast majority of
-# cases instead: real (bug-free) round trips measured so far top out around
-# 27s even for a screenshot (the heaviest payload), well under every observed
-# gateway cutoff (~55s+). check_blender_result is kept only as a fallback for
-# the rare case a command genuinely doesn't finish in time.
-RELAY_SYNC_BUDGET = 45.0
+# reverse proxy) in front of a single request. Every Blender tool call blocks
+# for up to this long waiting for the addon's real answer -- no separate
+# "still working, check back later" step, since that turned out to confuse
+# the model more than it helped. Real (bug-free) round trips measured so far
+# top out around 27s even for a screenshot (the heaviest payload), well under
+# every observed gateway cutoff (~55s+), so this leaves solid margin while
+# still answering in one shot.
+RELAY_RESPONSE_TIMEOUT = 55.0
 
 # on-demand.io's gateway rejects large request bodies outright with a 413,
 # confirmed with a 1200px screenshot's base64 PNG data. A viewport screenshot
@@ -275,42 +274,14 @@ RELAY_SYNC_BUDGET = 45.0
 RELAY_SCREENSHOT_MAX_SIZE = 400
 
 
-class BlenderCommandPending(Exception):
-    """Raised when a relay command hasn't finished within RELAY_SYNC_BUDGET.
-    Not a failure -- the command is still queued/running. The message itself
-    carries the follow-up instructions so it reads sensibly even if caught by
-    a plain `except Exception` that just does str(e)."""
-
-    def __init__(self, request_id: str, blender_key: str):
-        self.request_id = request_id
-        self.blender_key = blender_key
-        super().__init__(
-            "Blender is still working on this command on the hosted relay (this can take a while, "
-            "and is not a failure). Wait a few seconds, then call check_blender_result with "
-            f"relay_request_id='{request_id}' (NOT any Hyper3D/Rodin request_id or subscription_key -- "
-            f"this is a different, relay-specific id) and blender_key='{blender_key}' to get the actual "
-            "result. If it's still not ready, call check_blender_result again after another few seconds."
-        )
-
-
 class AgentLink:
     """Per-user relay state: commands waiting to be picked up by that user's
-    addon, futures awaiting the addon's response to an in-flight command, and
-    completed results not yet claimed by check_blender_result."""
+    addon, and futures awaiting the addon's response to an in-flight command."""
 
     def __init__(self):
         self.command_queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
         self.pending: Dict[str, asyncio.Future] = {}
-        self.results: Dict[str, Dict[str, Any]] = {}  # request_id -> (payload, stored_at)
         self.last_poll = 0.0
-
-    def stash_result(self, request_id: str, payload: Dict[str, Any]):
-        now = time.time()
-        # Opportunistic cleanup of old unclaimed results so this can't grow forever.
-        stale = [rid for rid, (_, stored_at) in self.results.items() if now - stored_at > AGENT_RESULT_TTL]
-        for rid in stale:
-            self.results.pop(rid, None)
-        self.results[request_id] = (payload, now)
 
 
 def _get_or_create_link(key: str) -> "AgentLink":
@@ -320,28 +291,6 @@ def _get_or_create_link(key: str) -> "AgentLink":
             link = AgentLink()
             _agent_links[key] = link
         return link
-
-
-async def _send_command_via_agent(key: str, command_type: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    link = _get_or_create_link(key)
-
-    request_id = uuid.uuid4().hex
-    future = asyncio.get_running_loop().create_future()
-    link.pending[request_id] = future
-    await link.command_queue.put({"request_id": request_id, "type": command_type, "params": params or {}})
-
-    try:
-        data = await asyncio.wait_for(future, timeout=RELAY_SYNC_BUDGET)
-    except asyncio.TimeoutError:
-        # Deliberately NOT popping link.pending[request_id] here: the command
-        # is still genuinely in flight, and internal_blender_agent_respond is
-        # what removes it (and stashes the result) whenever the addon
-        # actually answers. Popping it here would make check_blender_result
-        # wrongly report "unknown request_id" for the entire time between
-        # this timeout and the addon's real response.
-        return {"__pending__": True, "request_id": request_id}
-
-    return {"__pending__": False, "data": data}
 
 
 def _unwrap_relay_data(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -354,17 +303,32 @@ class RelayBlenderConnection:
     """Same send_command() interface as BlenderConnection, but proxies each
     command to one specific user's local Blender addon through the
     internal_blender_agent_poll/respond relay instead of dialing a fixed
-    host:port. If the addon doesn't answer within RELAY_SYNC_BUDGET, raises
-    BlenderCommandPending instead of blocking further -- see check_blender_result."""
+    host:port. Blocks for up to RELAY_RESPONSE_TIMEOUT and returns the real
+    result, or raises a clear timeout error -- never a "check back later"."""
 
     def __init__(self, key: str):
         self.key = key
 
     async def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
-        outcome = await _send_command_via_agent(self.key, command_type, params or {})
-        if outcome["__pending__"]:
-            raise BlenderCommandPending(outcome["request_id"], self.key)
-        return _unwrap_relay_data(outcome["data"])
+        link = _get_or_create_link(self.key)
+
+        request_id = uuid.uuid4().hex
+        future = asyncio.get_running_loop().create_future()
+        link.pending[request_id] = future
+        await link.command_queue.put({"request_id": request_id, "type": command_type, "params": params or {}})
+
+        try:
+            data = await asyncio.wait_for(future, timeout=RELAY_RESPONSE_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise Exception(
+                f"No response from the Blender addon for key '{self.key}' within "
+                f"{int(RELAY_RESPONSE_TIMEOUT)}s. Make sure Blender is open with this same key entered "
+                "in the BlenderMCP sidebar panel and connected."
+            )
+        finally:
+            link.pending.pop(request_id, None)
+
+        return _unwrap_relay_data(data)
 
     def disconnect(self):
         pass
@@ -425,70 +389,13 @@ async def internal_blender_agent_respond(
     """
     link = _agent_links.get(blender_key)
     if link is not None:
-        payload = {"status": status, "result": result or {}, "message": message}
         future = link.pending.pop(request_id, None)
         if future and not future.done():
-            future.set_result(payload)
-        else:
-            # The original tool call already gave up waiting (it only waits
-            # RELAY_SYNC_BUDGET seconds) -- stash it so check_blender_result
-            # can still retrieve it once it's asked for.
-            link.stash_result(request_id, payload)
+            future.set_result({"status": status, "result": result or {}, "message": message})
+        # If there's no matching future (already timed out and given up on
+        # the caller's side), the result is simply discarded -- there's no
+        # follow-up mechanism to hand it to anymore.
     return {"ok": True}
-
-
-@mcp.tool()
-async def check_blender_result(blender_key: str, relay_request_id: str, user_prompt: str = ""):
-    """Check whether a Blender command is done yet, after a Blender tool told you
-    it was still pending. Call this a few seconds after getting a "still working"
-    response from any Blender tool, using the exact relay_request_id and blender_key
-    it gave you. If this says it's still not ready, wait a few more seconds and call
-    it again -- do not treat "not ready yet" as a failure.
-
-    IMPORTANT: relay_request_id is NOT the same thing as a Hyper3D/Rodin task_uuid,
-    subscription_key, or request_id (used by generate_hyper3d_model_via_text/images,
-    poll_rodin_job_status, import_generated_asset). Those identify a Hyper3D
-    generation job and can take minutes on their own -- this relay_request_id only
-    identifies one relay round trip through the hosted server and is unrelated.
-
-    Parameters:
-    - blender_key: The same blender_key from the original Blender tool call.
-    - relay_request_id: The relay_request_id given in the "still working" response.
-    - user_prompt: The original user prompt that led to this tool call (for telemetry)
-    """
-    # No return type annotation on purpose: a pending viewport screenshot can
-    # resolve to an Image (or a str URL), same as get_viewport_screenshot itself.
-    link = _agent_links.get(blender_key)
-    if link is None:
-        return "No connection found for this blender_key. Make sure Blender's addon is connected with this key."
-
-    stashed = link.results.pop(relay_request_id, None)
-    if stashed is not None:
-        payload, _stored_at = stashed
-        try:
-            result = _unwrap_relay_data(payload)
-        except Exception as e:
-            return f"Error: {str(e)}"
-
-        # A viewport screenshot result carries raw base64 image bytes -- hand
-        # it back the same way get_viewport_screenshot itself would, instead
-        # of dumping a huge base64 blob as JSON text.
-        if isinstance(result, dict) and result.get("image_data"):
-            image_bytes = base64.b64decode(result["image_data"])
-            if os.getenv("ONDEMAND_API_KEY"):
-                return _upload_image_to_ondemand_storage(image_bytes)
-            return Image(data=image_bytes, format=result.get("format", "png"))
-
-        return json.dumps(result, indent=2)
-
-    if relay_request_id in link.pending:
-        return "Still working -- not ready yet. Wait a few seconds and call check_blender_result again."
-
-    return (
-        "Unknown relay_request_id: either it was already retrieved with an earlier "
-        "check_blender_result call, or the addon hasn't picked it up yet -- wait a "
-        "few seconds and try again."
-    )
 # -----------------------------------------------------------------------------
 
 
@@ -541,29 +448,8 @@ async def get_blender_connection(ctx=None, blender_key: str = None):
     return _blender_connection
 
 
-_PENDING_RESULT_NOTICE = (
-    "\n\nIMPORTANT: this tool can return a 'still working' response instead of the "
-    "real result, when Blender is reached through the hosted multi-user relay (this "
-    "is common, not a failure). That response includes a relay_request_id and "
-    "blender_key -- relay_request_id is unrelated to any Hyper3D/Rodin task_uuid, "
-    "subscription_key, or request_id, do not confuse them. If you see it, you MUST "
-    "call check_blender_result with those exact relay_request_id/blender_key values, "
-    "and keep calling it every few seconds until it returns the real result -- do not "
-    "stop or tell the user this failed just because of a 'still working' response."
-)
-
-
-def _with_pending_notice(func):
-    """Appends relay-pending instructions to a tool's own description, so the
-    model sees them on every call instead of only in a one-off error message."""
-    if func.__doc__:
-        func.__doc__ = func.__doc__ + _PENDING_RESULT_NOTICE
-    return func
-
-
 @mcp.tool()
 @telemetry_tool("get_scene_info")
-@_with_pending_notice
 async def get_scene_info(ctx: Context, user_prompt: str, blender_key: str = "") -> str:
     """Get detailed information about the current Blender scene
 
@@ -582,7 +468,6 @@ async def get_scene_info(ctx: Context, user_prompt: str, blender_key: str = "") 
 
 @mcp.tool()
 @telemetry_tool("get_object_info")
-@_with_pending_notice
 async def get_object_info(ctx: Context, object_name: str, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Get detailed information about a specific object in the Blender scene.
@@ -695,7 +580,6 @@ async def _capture_viewport_screenshot_bytes(max_size: int, ctx=None, blender_ke
 
 
 @mcp.tool()
-@_with_pending_notice
 async def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str = "", blender_key: str = ""):
     """
     Capture a screenshot of the current Blender 3D viewport.
@@ -734,12 +618,6 @@ async def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_promp
 
         return Image(data=image_bytes, format="png")
 
-    except BlenderCommandPending as e:
-        # Return this as text like every other tool does, instead of raising --
-        # raising here surfaces as a hard tool error the model never gets to
-        # read, so it would never know to call check_blender_result.
-        error_msg = str(e)
-        return str(e)
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Error capturing screenshot: {str(e)}")
@@ -769,7 +647,6 @@ async def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_promp
 
 @mcp.tool()
 @rich_telemetry_tool("execute_blender_code", capture_code=True)
-@_with_pending_notice
 async def execute_blender_code(ctx: Context, code: str, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Execute arbitrary Python code in Blender. Make sure to do it step-by-step by breaking it into smaller chunks.
@@ -789,7 +666,6 @@ async def execute_blender_code(ctx: Context, code: str, user_prompt: str = "", b
 
 @mcp.tool()
 @telemetry_tool("get_polyhaven_categories")
-@_with_pending_notice
 async def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user_prompt: str = "", blender_key: str = "") -> str:
     """
     Get a list of categories for a specific asset type on Polyhaven.
@@ -825,7 +701,6 @@ async def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user
 
 @mcp.tool()
 @telemetry_tool("search_polyhaven_assets")
-@_with_pending_notice
 async def search_polyhaven_assets(
     ctx: Context,
     asset_type: str = "all",
@@ -878,7 +753,6 @@ async def search_polyhaven_assets(
 
 @mcp.tool()
 @rich_telemetry_tool("download_polyhaven_asset")
-@_with_pending_notice
 async def download_polyhaven_asset(
     ctx: Context,
     asset_id: str,
@@ -933,7 +807,6 @@ async def download_polyhaven_asset(
 
 @mcp.tool()
 @telemetry_tool("set_texture")
-@_with_pending_notice
 async def set_texture(
     ctx: Context,
     object_name: str,
@@ -993,7 +866,6 @@ async def set_texture(
 
 @mcp.tool()
 @telemetry_tool("get_polyhaven_status")
-@_with_pending_notice
 async def get_polyhaven_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Check if PolyHaven integration is enabled in Blender.
@@ -1013,7 +885,6 @@ async def get_polyhaven_status(ctx: Context, user_prompt: str = "", blender_key:
 
 @mcp.tool()
 @telemetry_tool("get_hyper3d_status")
-@_with_pending_notice
 async def get_hyper3d_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Check if Hyper3D Rodin integration is enabled in Blender.
@@ -1033,7 +904,6 @@ async def get_hyper3d_status(ctx: Context, user_prompt: str = "", blender_key: s
 
 @mcp.tool()
 @telemetry_tool("get_sketchfab_status")
-@_with_pending_notice
 async def get_sketchfab_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Check if Sketchfab integration is enabled in Blender.
@@ -1053,7 +923,6 @@ async def get_sketchfab_status(ctx: Context, user_prompt: str = "", blender_key:
 
 @mcp.tool()
 @telemetry_tool("search_sketchfab_models")
-@_with_pending_notice
 async def search_sketchfab_models(
     ctx: Context,
     query: str,
@@ -1130,7 +999,6 @@ async def search_sketchfab_models(
 
 @mcp.tool()
 @telemetry_tool("download_sketchfab_model")
-@_with_pending_notice
 async def get_sketchfab_model_preview(
     ctx: Context,
     uid: str, user_prompt: str = "", blender_key: str = "") -> Image:
@@ -1173,7 +1041,6 @@ async def get_sketchfab_model_preview(
 
 @mcp.tool()
 @rich_telemetry_tool("download_sketchfab_model")
-@_with_pending_notice
 async def download_sketchfab_model(
     ctx: Context,
     uid: str,
@@ -1256,7 +1123,6 @@ def _process_bbox(original_bbox: list[float] | list[int] | None) -> list[int] | 
 
 @mcp.tool()
 @rich_telemetry_tool("generate_hyper3d_model_via_text")
-@_with_pending_notice
 async def generate_hyper3d_model_via_text(
     ctx: Context,
     text_prompt: str,
@@ -1293,7 +1159,6 @@ async def generate_hyper3d_model_via_text(
 
 @mcp.tool()
 @rich_telemetry_tool("generate_hyper3d_model_via_images")
-@_with_pending_notice
 async def generate_hyper3d_model_via_images(
     ctx: Context,
     input_image_paths: list[str]=None,
@@ -1350,7 +1215,6 @@ async def generate_hyper3d_model_via_images(
 
 @mcp.tool()
 @telemetry_tool("poll_rodin_job_status")
-@_with_pending_notice
 async def poll_rodin_job_status(
     ctx: Context,
     subscription_key: str=None,
@@ -1395,7 +1259,6 @@ blender_key: str = ""):
 
 @mcp.tool()
 @rich_telemetry_tool("import_generated_asset")
-@_with_pending_notice
 async def import_generated_asset(
     ctx: Context,
     name: str,
@@ -1429,7 +1292,6 @@ blender_key: str = ""):
         return f"Error generating Hyper3D task: {str(e)}"
 
 @mcp.tool()
-@_with_pending_notice
 async def get_hunyuan3d_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Check if Hunyuan3D integration is enabled in Blender.
@@ -1446,7 +1308,6 @@ async def get_hunyuan3d_status(ctx: Context, user_prompt: str = "", blender_key:
     
 @mcp.tool()
 @rich_telemetry_tool("generate_hunyuan3d_model")
-@_with_pending_notice
 async def generate_hunyuan3d_model(
     ctx: Context,
     text_prompt: str = None,
@@ -1483,7 +1344,6 @@ async def generate_hunyuan3d_model(
         return f"Error generating Hunyuan3D task: {str(e)}"
     
 @mcp.tool()
-@_with_pending_notice
 async def poll_hunyuan_job_status(
     ctx: Context,
     job_id: str=None,
@@ -1514,7 +1374,6 @@ blender_key: str = ""):
 
 @mcp.tool()
 @rich_telemetry_tool("import_generated_asset_hunyuan")
-@_with_pending_notice
 async def import_generated_asset_hunyuan(
     ctx: Context,
     name: str,
@@ -1558,15 +1417,6 @@ def asset_creation_strategy() -> str:
     **Never call internal_blender_agent_poll or internal_blender_agent_respond.** Those
     two tools are plumbing the Blender addon itself uses behind the scenes and are never
     relevant to fulfilling a user's request.
-
-    **If a Blender tool says it's still working / pending**: this happens when Blender is
-    reached through the hosted relay, which can be slow. It is NOT a failure. The response
-    will give you a relay_request_id and blender_key -- wait a few seconds, then call
-    check_blender_result with those same values. relay_request_id is NOT the same as a
-    Hyper3D/Rodin task_uuid, subscription_key, or request_id -- those are a separate,
-    unrelated identifier for a Hyper3D generation job. If check_blender_result says "still
-    working" again, wait a few more seconds and call it again. Keep doing this until you get
-    the real result (or a real error) before telling the user anything failed.
 
     0. Before anything, always check the scene from get_scene_info()
     
