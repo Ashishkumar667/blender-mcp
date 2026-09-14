@@ -267,6 +267,13 @@ AGENT_RESULT_TTL = 600.0  # how long a completed-but-unretrieved result is kept 
 # the rare case a command genuinely doesn't finish in time.
 RELAY_SYNC_BUDGET = 45.0
 
+# on-demand.io's gateway rejects large request bodies outright with a 413,
+# confirmed with a 1200px screenshot's base64 PNG data. A viewport screenshot
+# at this size is typically well under 100KB as PNG, comfortably clear of
+# that limit -- this only applies when going through the relay; a direct
+# local/stdio connection isn't limited this way.
+RELAY_SCREENSHOT_MAX_SIZE = 400
+
 
 class BlenderCommandPending(Exception):
     """Raised when a relay command hasn't finished within RELAY_SYNC_BUDGET.
@@ -280,8 +287,9 @@ class BlenderCommandPending(Exception):
         super().__init__(
             "Blender is still working on this command on the hosted relay (this can take a while, "
             "and is not a failure). Wait a few seconds, then call check_blender_result with "
-            f"request_id='{request_id}' and blender_key='{blender_key}' to get the actual result. "
-            "If it's still not ready, call check_blender_result again after another few seconds."
+            f"relay_request_id='{request_id}' (NOT any Hyper3D/Rodin request_id or subscription_key -- "
+            f"this is a different, relay-specific id) and blender_key='{blender_key}' to get the actual "
+            "result. If it's still not ready, call check_blender_result again after another few seconds."
         )
 
 
@@ -325,9 +333,13 @@ async def _send_command_via_agent(key: str, command_type: str, params: Dict[str,
     try:
         data = await asyncio.wait_for(future, timeout=RELAY_SYNC_BUDGET)
     except asyncio.TimeoutError:
+        # Deliberately NOT popping link.pending[request_id] here: the command
+        # is still genuinely in flight, and internal_blender_agent_respond is
+        # what removes it (and stashes the result) whenever the addon
+        # actually answers. Popping it here would make check_blender_result
+        # wrongly report "unknown request_id" for the entire time between
+        # this timeout and the addon's real response.
         return {"__pending__": True, "request_id": request_id}
-    finally:
-        link.pending.pop(request_id, None)
 
     return {"__pending__": False, "data": data}
 
@@ -426,16 +438,22 @@ async def internal_blender_agent_respond(
 
 
 @mcp.tool()
-async def check_blender_result(blender_key: str, request_id: str, user_prompt: str = ""):
+async def check_blender_result(blender_key: str, relay_request_id: str, user_prompt: str = ""):
     """Check whether a Blender command is done yet, after a Blender tool told you
     it was still pending. Call this a few seconds after getting a "still working"
-    response from any Blender tool, using the exact request_id and blender_key it
-    gave you. If this says it's still not ready, wait a few more seconds and call
+    response from any Blender tool, using the exact relay_request_id and blender_key
+    it gave you. If this says it's still not ready, wait a few more seconds and call
     it again -- do not treat "not ready yet" as a failure.
+
+    IMPORTANT: relay_request_id is NOT the same thing as a Hyper3D/Rodin task_uuid,
+    subscription_key, or request_id (used by generate_hyper3d_model_via_text/images,
+    poll_rodin_job_status, import_generated_asset). Those identify a Hyper3D
+    generation job and can take minutes on their own -- this relay_request_id only
+    identifies one relay round trip through the hosted server and is unrelated.
 
     Parameters:
     - blender_key: The same blender_key from the original Blender tool call.
-    - request_id: The request_id given in the "still working" response.
+    - relay_request_id: The relay_request_id given in the "still working" response.
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     # No return type annotation on purpose: a pending viewport screenshot can
@@ -444,7 +462,7 @@ async def check_blender_result(blender_key: str, request_id: str, user_prompt: s
     if link is None:
         return "No connection found for this blender_key. Make sure Blender's addon is connected with this key."
 
-    stashed = link.results.pop(request_id, None)
+    stashed = link.results.pop(relay_request_id, None)
     if stashed is not None:
         payload, _stored_at = stashed
         try:
@@ -463,11 +481,11 @@ async def check_blender_result(blender_key: str, request_id: str, user_prompt: s
 
         return json.dumps(result, indent=2)
 
-    if request_id in link.pending:
+    if relay_request_id in link.pending:
         return "Still working -- not ready yet. Wait a few seconds and call check_blender_result again."
 
     return (
-        "Unknown request_id: either it was already retrieved with an earlier "
+        "Unknown relay_request_id: either it was already retrieved with an earlier "
         "check_blender_result call, or the addon hasn't picked it up yet -- wait a "
         "few seconds and try again."
     )
@@ -526,10 +544,12 @@ async def get_blender_connection(ctx=None, blender_key: str = None):
 _PENDING_RESULT_NOTICE = (
     "\n\nIMPORTANT: this tool can return a 'still working' response instead of the "
     "real result, when Blender is reached through the hosted multi-user relay (this "
-    "is common, not a failure). That response includes a request_id and blender_key. "
-    "If you see it, you MUST call check_blender_result with those exact values, and "
-    "keep calling it every few seconds until it returns the real result -- do not stop "
-    "or tell the user this failed just because of a 'still working' response."
+    "is common, not a failure). That response includes a relay_request_id and "
+    "blender_key -- relay_request_id is unrelated to any Hyper3D/Rodin task_uuid, "
+    "subscription_key, or request_id, do not confuse them. If you see it, you MUST "
+    "call check_blender_result with those exact relay_request_id/blender_key values, "
+    "and keep calling it every few seconds until it returns the real result -- do not "
+    "stop or tell the user this failed just because of a 'still working' response."
 )
 
 
@@ -648,6 +668,13 @@ def _upload_image_to_ondemand_storage(image_bytes: bytes, mime_type: str = "imag
 async def _capture_viewport_screenshot_bytes(max_size: int, ctx=None, blender_key: str = "") -> bytes:
     """Ask Blender for a viewport screenshot and return the raw image bytes."""
     blender = await get_blender_connection(ctx, blender_key)
+
+    if isinstance(blender, RelayBlenderConnection):
+        # The full base64 image has to fit in a single HTTP request through
+        # on-demand.io's gateway, which rejects large bodies outright with a
+        # 413 (confirmed: max_size=1200 was too big, regardless of how long
+        # anything waits). Cap it to something that reliably fits.
+        max_size = min(max_size, RELAY_SCREENSHOT_MAX_SIZE)
 
     result = await blender.send_command("get_viewport_screenshot", {
         "max_size": max_size,
@@ -1363,8 +1390,8 @@ blender_key: str = ""):
         result = await blender.send_command("poll_rodin_job_status", kwargs)
         return result
     except Exception as e:
-        logger.error(f"Error generating Hyper3D task: {str(e)}")
-        return f"Error generating Hyper3D task: {str(e)}"
+        logger.error(f"Error polling Hyper3D job status: {str(e)}")
+        return f"Error polling Hyper3D job status: {str(e)}"
 
 @mcp.tool()
 @rich_telemetry_tool("import_generated_asset")
@@ -1534,10 +1561,12 @@ def asset_creation_strategy() -> str:
 
     **If a Blender tool says it's still working / pending**: this happens when Blender is
     reached through the hosted relay, which can be slow. It is NOT a failure. The response
-    will give you a request_id and blender_key -- wait a few seconds, then call
-    check_blender_result with those same values. If it says "still working" again, wait a
-    few more seconds and call it again. Keep doing this until you get the real result (or a
-    real error) before telling the user anything failed.
+    will give you a relay_request_id and blender_key -- wait a few seconds, then call
+    check_blender_result with those same values. relay_request_id is NOT the same as a
+    Hyper3D/Rodin task_uuid, subscription_key, or request_id -- those are a separate,
+    unrelated identifier for a Hyper3D generation job. If check_blender_result says "still
+    working" again, wait a few more seconds and call it again. Keep doing this until you get
+    the real result (or a real error) before telling the user anything failed.
 
     0. Before anything, always check the scene from get_scene_info()
     
