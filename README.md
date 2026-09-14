@@ -310,38 +310,33 @@ For headless setups or CI, credentials can also be injected by environment varia
 ## Hosting BlenderMCP for multiple users (e.g. on-demand.io)
 
 Normally the MCP server and Blender run on the same machine, so `BLENDER_HOST`/
-`BLENDER_PORT` just point at `localhost`. That breaks down once you deploy
-this server once and share it with other people (for example as a hosted
-tool on a platform like on-demand.io): the server has no way to reach into
-any individual user's computer, since a random person's Blender install
-isn't reachable from the outside.
+`BLENDER_PORT` just point at `localhost`. That breaks down once this server is
+deployed once and shared by many people through one hosted agent/tool (for
+example on a platform like on-demand.io): the server has no way to reach into
+any individual user's computer, and end users of a shared agent never see or
+edit its MCP server URL themselves.
 
-To support that case, this server can act as a relay. Each user runs a small
-local script, [`bridge_agent.py`](bridge_agent.py), next to their own
-Blender. It connects *outward* to the hosted server (no inbound port needed
-on the user's side) and forwards commands to their local Blender addon.
+To support that, every Blender tool takes a `blender_key` argument identifying
+whose Blender to control, and the Blender addon itself (`addon.py`) can
+connect outward to the hosted server to receive commands for that key --
+no separate program to install, no inbound port on the user's side.
 
-**Setup per user:**
+**Setup per user (entirely inside Blender):**
 
-1. Pick a personal key (any unique string, e.g. a UUID).
-2. Run the bridge agent locally, with Blender open and the addon's "Connect
-   to Claude" button pressed:
-   ```bash
-   pip install websockets
-   python bridge_agent.py --relay-url wss://<your-hosted-server>/agent --key YOUR_KEY
-   ```
-3. Configure the MCP tool (in the on-demand.io playground, or any MCP
-   client) with the server URL set to:
-   ```
-   https://<your-hosted-server>/mcp?blender_key=YOUR_KEY
-   ```
+1. Install `addon.py` as usual (see Installation above) and open the
+   BlenderMCP sidebar tab.
+2. Under **"Hosted Connection (multi-user AI)"**, enter the Server URL (the
+   hosted deployment's base URL) and a Personal Key (any unique string they
+   choose, e.g. a UUID).
+3. Click **"Connect to Hosted Server"**.
+4. In their conversation with the shared agent, they tell it their Personal
+   Key once (e.g. "my blender key is ..."); the model then supplies that same
+   key on every Blender tool call for the rest of the conversation.
 
-As long as the bridge agent keeps running, tool calls made with that
-`blender_key` are routed to that user's own Blender. Different users just
-need different keys — no shared config, no manually exposing a TCP port.
-
-This mode requires the server to run with `MCP_TRANSPORT=streamable-http`
-(already the default in the provided `Dockerfile`).
+Different users just need different keys — nobody edits the deployment's
+config, and nobody exposes a TCP port. This mode requires the server to run
+with `MCP_TRANSPORT=streamable-http` (already the default in the provided
+`Dockerfile`).
 
 ## Troubleshooting
 

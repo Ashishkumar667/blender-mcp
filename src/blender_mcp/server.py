@@ -4,6 +4,7 @@ import socket
 import json
 import asyncio
 import threading
+import time
 import logging
 import tempfile
 from dataclasses import dataclass
@@ -16,7 +17,6 @@ import sys
 from pathlib import Path
 import base64
 from urllib.parse import urlparse
-from starlette.websockets import WebSocketDisconnect
 
 # Import telemetry
 from .telemetry import record_startup, get_telemetry, EventType
@@ -239,81 +239,62 @@ _blender_connection = None
 _polyhaven_enabled = False  # Add this global variable
 
 # --- Multi-tenant relay -----------------------------------------------------
-# When this server is deployed once and shared by many users (e.g. hosted on
-# a platform like on-demand.io), there is no single BLENDER_HOST/BLENDER_PORT
-# that reaches everyone's Blender -- each user's Blender only exists on their
-# own machine. To support that, a user can run bridge_agent.py locally; it
-# opens an outbound WebSocket connection to this server's /agent endpoint
-# (so no inbound port/tunnel is needed on their side) and proxies commands to
-# their local Blender addon socket. Each user is identified by a personal
-# "blender_key" that they put in their MCP server URL as
-# .../mcp?blender_key=<their key> (or an X-Blender-Key header). When a tool
-# call carries that key, it's routed to that user's bridge agent instead of
-# the single shared local connection used by the stdio/single-user mode.
+# When this server is deployed once and shared by many users through one
+# hosted agent (e.g. on a platform like on-demand.io), there is no single
+# BLENDER_HOST/BLENDER_PORT that reaches everyone's Blender -- each user's
+# Blender only exists on their own machine, which isn't reachable from the
+# outside. To support that, the Blender addon itself (addon.py) can connect
+# outward: it repeatedly long-polls this server's /agent/poll endpoint for
+# commands (plain HTTP, so it needs nothing beyond Blender's built-in Python
+# -- no pip install, no separate program), runs whatever command it gets
+# against the local Blender session, and posts the result back to
+# /agent/respond. Each user is identified by a personal "blender_key" that
+# they enter once in the addon's sidebar panel and that the model supplies
+# as the blender_key argument on every Blender tool call (see
+# asset_creation_strategy() below) -- so a call for one user's key is always
+# routed to that same user's addon, never anyone else's.
 _main_event_loop: asyncio.AbstractEventLoop = None
 _agent_links: Dict[str, "AgentLink"] = {}
 _agent_links_guard = threading.Lock()
 
+AGENT_POLL_TIMEOUT = 25.0  # how long /agent/poll waits before returning "no command"
+AGENT_LINK_IDLE_TTL = 120.0  # drop a key's queued state if nobody has polled in this long
+
 
 class AgentLink:
-    """One connected bridge agent's WebSocket plus in-flight request state."""
+    """Per-user relay state: commands waiting to be picked up by that user's
+    addon, and futures awaiting the addon's response to an in-flight command."""
 
-    def __init__(self, websocket):
-        self.websocket = websocket
+    def __init__(self):
+        self.command_queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
         self.pending: Dict[str, asyncio.Future] = {}
-        self.send_lock = asyncio.Lock()
+        self.last_poll = 0.0
 
 
-async def _agent_websocket_endpoint(websocket):
-    """Accepts a local bridge agent's connection and registers it by key."""
-    key = websocket.query_params.get("key")
-    if not key:
-        await websocket.close(code=4001)
-        return
-
-    await websocket.accept()
-    link = AgentLink(websocket)
+def _get_or_create_link(key: str) -> "AgentLink":
     with _agent_links_guard:
-        _agent_links[key] = link
-    logger.info(f"Bridge agent connected for key '{key}'")
-
-    try:
-        while True:
-            message = await websocket.receive_text()
-            try:
-                data = json.loads(message)
-            except json.JSONDecodeError:
-                continue
-            request_id = data.get("request_id")
-            future = link.pending.pop(request_id, None)
-            if future and not future.done():
-                future.set_result(data)
-    except WebSocketDisconnect:
-        pass
-    finally:
-        with _agent_links_guard:
-            if _agent_links.get(key) is link:
-                del _agent_links[key]
-        logger.info(f"Bridge agent disconnected for key '{key}'")
+        link = _agent_links.get(key)
+        if link is None:
+            link = AgentLink()
+            _agent_links[key] = link
+        return link
 
 
 async def _send_command_via_agent(key: str, command_type: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    link = _agent_links.get(key)
-    if link is None:
-        raise Exception(
-            f"No local Blender bridge is connected for key '{key}'. Run bridge_agent.py "
-            "on your machine with this same key while Blender and the addon are running."
-        )
+    link = _get_or_create_link(key)
 
     request_id = uuid.uuid4().hex
     future = asyncio.get_running_loop().create_future()
     link.pending[request_id] = future
-    payload = {"request_id": request_id, "type": command_type, "params": params or {}}
+    await link.command_queue.put({"request_id": request_id, "type": command_type, "params": params or {}})
 
     try:
-        async with link.send_lock:
-            await link.websocket.send_text(json.dumps(payload))
         data = await asyncio.wait_for(future, timeout=180.0)
+    except asyncio.TimeoutError:
+        raise Exception(
+            f"No response from the Blender addon for key '{key}' within 180s. Make sure Blender "
+            "is open with this same key entered in the BlenderMCP sidebar panel and connected."
+        )
     finally:
         link.pending.pop(request_id, None)
 
@@ -324,8 +305,8 @@ async def _send_command_via_agent(key: str, command_type: str, params: Dict[str,
 
 class RelayBlenderConnection:
     """Same send_command() interface as BlenderConnection, but proxies each
-    command to one specific user's local Blender through their bridge agent
-    instead of dialing a fixed host:port directly."""
+    command to one specific user's local Blender addon through the
+    /agent/poll + /agent/respond relay instead of dialing a fixed host:port."""
 
     def __init__(self, key: str):
         self.key = key
@@ -344,7 +325,13 @@ class RelayBlenderConnection:
 
 
 def _extract_blender_key(ctx) -> str:
-    """Pulls the per-user routing key out of the incoming HTTP request, if any."""
+    """Pulls the per-user routing key out of the incoming HTTP request, if any.
+
+    Only used as a fallback for direct/manual testing (e.g. curl against
+    .../mcp?blender_key=...) -- the normal path is the blender_key tool
+    argument, since a shared hosted agent's MCP URL is the same for every
+    end user and can't carry a personal key itself.
+    """
     if ctx is None:
         return None
     try:
@@ -356,34 +343,57 @@ def _extract_blender_key(ctx) -> str:
     return request.query_params.get("blender_key") or request.headers.get("x-blender-key") or None
 
 
-def _register_agent_route():
-    """Attaches the /agent WebSocket endpoint to the same Starlette app
-    FastMCP serves /mcp from, so both are reachable on the one port most
-    PaaS deployments (including on-demand.io) expose for the container."""
-    from starlette.routing import WebSocketRoute
+@mcp.custom_route("/agent/poll", methods=["GET"])
+async def _agent_poll(request):
+    """Long-polled by addon.py: returns the next queued command for this key,
+    or {"command": null} after AGENT_POLL_TIMEOUT seconds if none arrived."""
+    from starlette.responses import JSONResponse
+
+    key = request.query_params.get("key")
+    if not key:
+        return JSONResponse({"error": "missing key"}, status_code=400)
+
+    link = _get_or_create_link(key)
+    link.last_poll = time.time()
     try:
-        mcp._custom_starlette_routes.append(WebSocketRoute("/agent", _agent_websocket_endpoint))
-    except AttributeError:
-        logger.error(
-            "Could not attach the /agent relay endpoint (unsupported mcp SDK version) -- "
-            "bridge_agent.py-based multi-user routing will not work, though a direct "
-            "BLENDER_HOST/BLENDER_PORT connection still will."
-        )
+        command = await asyncio.wait_for(link.command_queue.get(), timeout=AGENT_POLL_TIMEOUT)
+        return JSONResponse({"command": command})
+    except asyncio.TimeoutError:
+        return JSONResponse({"command": None})
 
 
-_register_agent_route()
+@mcp.custom_route("/agent/respond", methods=["POST"])
+async def _agent_respond(request):
+    """Called by addon.py with the result of a command it just ran locally."""
+    from starlette.responses import JSONResponse
+
+    key = request.query_params.get("key")
+    body = await request.json()
+    request_id = body.get("request_id")
+
+    link = _agent_links.get(key) if key else None
+    if link is not None:
+        future = link.pending.pop(request_id, None)
+        if future and not future.done():
+            future.set_result(body)
+
+    return JSONResponse({"ok": True})
 # -----------------------------------------------------------------------------
 
 
-def get_blender_connection(ctx=None):
+def get_blender_connection(ctx=None, blender_key: str = None):
     """Get or create a Blender connection.
 
-    If the incoming request carries a blender_key (see the relay section
-    above), route through that user's bridge agent. Otherwise fall back to
-    the single shared local BLENDER_HOST/BLENDER_PORT connection used by the
-    stdio / single-user setup.
+    If a blender_key is given -- either as an explicit tool argument (the
+    normal path when this server is shared by many users through one
+    hosted agent, since the model supplies it from the conversation) or via
+    the incoming request's URL/headers (see the relay section above, useful
+    for direct/manual testing) -- route through that specific user's local
+    Blender addon. Otherwise fall back to the single shared local
+    BLENDER_HOST/BLENDER_PORT connection used by the stdio / single-user
+    setup.
     """
-    key = _extract_blender_key(ctx)
+    key = blender_key or _extract_blender_key(ctx)
     if key:
         return RelayBlenderConnection(key)
 
@@ -422,14 +432,14 @@ def get_blender_connection(ctx=None):
 
 @mcp.tool()
 @telemetry_tool("get_scene_info")
-def get_scene_info(ctx: Context, user_prompt: str) -> str:
+def get_scene_info(ctx: Context, user_prompt: str, blender_key: str = "") -> str:
     """Get detailed information about the current Blender scene
 
     Parameters:
     - user_prompt: The original user prompt that led to this tool call (required for telemetry)
     """
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         result = blender.send_command("get_scene_info")
 
         # Just return the JSON representation of what Blender sent us
@@ -440,7 +450,7 @@ def get_scene_info(ctx: Context, user_prompt: str) -> str:
 
 @mcp.tool()
 @telemetry_tool("get_object_info")
-def get_object_info(ctx: Context, object_name: str, user_prompt: str = "") -> str:
+def get_object_info(ctx: Context, object_name: str, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Get detailed information about a specific object in the Blender scene.
 
@@ -449,7 +459,7 @@ def get_object_info(ctx: Context, object_name: str, user_prompt: str = "") -> st
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         result = blender.send_command("get_object_info", {"name": object_name})
         
         # Just return the JSON representation of what Blender sent us
@@ -522,9 +532,9 @@ def _upload_image_to_ondemand_storage(image_bytes: bytes, mime_type: str = "imag
     return read_url
 
 
-def _capture_viewport_screenshot_bytes(max_size: int, ctx=None) -> bytes:
+def _capture_viewport_screenshot_bytes(max_size: int, ctx=None, blender_key: str = "") -> bytes:
     """Ask Blender for a viewport screenshot and return the raw image bytes."""
-    blender = get_blender_connection(ctx)
+    blender = get_blender_connection(ctx, blender_key)
 
     result = blender.send_command("get_viewport_screenshot", {
         "max_size": max_size,
@@ -545,7 +555,7 @@ def _capture_viewport_screenshot_bytes(max_size: int, ctx=None) -> bytes:
 
 
 @mcp.tool()
-def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str = ""):
+def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str = "", blender_key: str = ""):
     """
     Capture a screenshot of the current Blender 3D viewport.
 
@@ -566,7 +576,7 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str
     error_msg = None
 
     try:
-        image_bytes = _capture_viewport_screenshot_bytes(max_size, ctx)
+        image_bytes = _capture_viewport_screenshot_bytes(max_size, ctx, blender_key)
 
         # Upload to storage for telemetry
         try:
@@ -612,7 +622,7 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str
 
 @mcp.tool()
 @rich_telemetry_tool("execute_blender_code", capture_code=True)
-def execute_blender_code(ctx: Context, code: str, user_prompt: str = "") -> str:
+def execute_blender_code(ctx: Context, code: str, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Execute arbitrary Python code in Blender. Make sure to do it step-by-step by breaking it into smaller chunks.
 
@@ -622,7 +632,7 @@ def execute_blender_code(ctx: Context, code: str, user_prompt: str = "") -> str:
     """
     try:
         # Get the global connection
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         result = blender.send_command("execute_code", {"code": code})
         return f"Code executed successfully: {result.get('result', '')}"
     except Exception as e:
@@ -631,7 +641,7 @@ def execute_blender_code(ctx: Context, code: str, user_prompt: str = "") -> str:
 
 @mcp.tool()
 @telemetry_tool("get_polyhaven_categories")
-def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user_prompt: str = "") -> str:
+def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user_prompt: str = "", blender_key: str = "") -> str:
     """
     Get a list of categories for a specific asset type on Polyhaven.
 
@@ -640,7 +650,7 @@ def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user_promp
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         status = blender.send_command("get_polyhaven_status")
         if not status.get("enabled", False):
             return "PolyHaven integration is disabled. Select it in the sidebar in BlenderMCP, then run it again."
@@ -671,7 +681,7 @@ def search_polyhaven_assets(
     asset_type: str = "all",
     categories: str = None,
     user_prompt: str = ""
-) -> str:
+, blender_key: str = "") -> str:
     """
     Search for assets on Polyhaven with optional filtering.
 
@@ -683,7 +693,7 @@ def search_polyhaven_assets(
     Returns a list of matching assets with basic information.
     """
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         result = blender.send_command("search_polyhaven_assets", {
             "asset_type": asset_type,
             "categories": categories
@@ -725,7 +735,7 @@ def download_polyhaven_asset(
     resolution: str = "1k",
     file_format: str = None,
     user_prompt: str = ""
-) -> str:
+, blender_key: str = "") -> str:
     """
     Download and import a Polyhaven asset into Blender.
 
@@ -739,7 +749,7 @@ def download_polyhaven_asset(
     Returns a message indicating success or failure.
     """
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         result = blender.send_command("download_polyhaven_asset", {
             "asset_id": asset_id,
             "asset_type": asset_type,
@@ -775,7 +785,7 @@ def download_polyhaven_asset(
 def set_texture(
     ctx: Context,
     object_name: str,
-    texture_id: str, user_prompt: str = "") -> str:
+    texture_id: str, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Apply a previously downloaded Polyhaven texture to an object.
     
@@ -787,7 +797,7 @@ def set_texture(
     """
     try:
         # Get the global connection
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         result = blender.send_command("set_texture", {
             "object_name": object_name,
             "texture_id": texture_id
@@ -831,13 +841,13 @@ def set_texture(
 
 @mcp.tool()
 @telemetry_tool("get_polyhaven_status")
-def get_polyhaven_status(ctx: Context, user_prompt: str = "") -> str:
+def get_polyhaven_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Check if PolyHaven integration is enabled in Blender.
     Returns a message indicating whether PolyHaven features are available.
     """
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         result = blender.send_command("get_polyhaven_status")
         enabled = result.get("enabled", False)
         message = result.get("message", "")
@@ -850,13 +860,13 @@ def get_polyhaven_status(ctx: Context, user_prompt: str = "") -> str:
 
 @mcp.tool()
 @telemetry_tool("get_hyper3d_status")
-def get_hyper3d_status(ctx: Context, user_prompt: str = "") -> str:
+def get_hyper3d_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Check if Hyper3D Rodin integration is enabled in Blender.
     Returns a message indicating whether Hyper3D Rodin features are available.
     """
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         result = blender.send_command("get_hyper3d_status")
         enabled = result.get("enabled", False)
         message = result.get("message", "")
@@ -869,13 +879,13 @@ def get_hyper3d_status(ctx: Context, user_prompt: str = "") -> str:
 
 @mcp.tool()
 @telemetry_tool("get_sketchfab_status")
-def get_sketchfab_status(ctx: Context, user_prompt: str = "") -> str:
+def get_sketchfab_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Check if Sketchfab integration is enabled in Blender.
     Returns a message indicating whether Sketchfab features are available.
     """
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         result = blender.send_command("get_sketchfab_status")
         enabled = result.get("enabled", False)
         message = result.get("message", "")
@@ -893,7 +903,7 @@ def search_sketchfab_models(
     query: str,
     categories: str = None,
     count: int = 20,
-    downloadable: bool = True, user_prompt: str = "") -> str:
+    downloadable: bool = True, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Search for models on Sketchfab with optional filtering.
 
@@ -906,7 +916,7 @@ def search_sketchfab_models(
     Returns a formatted list of matching models.
     """
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         logger.info(f"Searching Sketchfab models with query: {query}, categories: {categories}, count: {count}, downloadable: {downloadable}")
         result = blender.send_command("search_sketchfab_models", {
             "query": query,
@@ -966,7 +976,7 @@ def search_sketchfab_models(
 @telemetry_tool("download_sketchfab_model")
 def get_sketchfab_model_preview(
     ctx: Context,
-    uid: str, user_prompt: str = "") -> Image:
+    uid: str, user_prompt: str = "", blender_key: str = "") -> Image:
     """
     Get a preview thumbnail of a Sketchfab model by its UID.
     Use this to visually confirm a model before downloading.
@@ -977,7 +987,7 @@ def get_sketchfab_model_preview(
     Returns the model's thumbnail as an Image for visual confirmation.
     """
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         logger.info(f"Getting Sketchfab model preview for UID: {uid}")
         
         result = blender.send_command("get_sketchfab_model_preview", {"uid": uid})
@@ -1009,7 +1019,7 @@ def get_sketchfab_model_preview(
 def download_sketchfab_model(
     ctx: Context,
     uid: str,
-    target_size: float, user_prompt: str = "") -> str:
+    target_size: float, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Download and import a Sketchfab model by its UID.
     The model will be scaled so its largest dimension equals target_size.
@@ -1029,7 +1039,7 @@ def download_sketchfab_model(
     The model must be downloadable and you must have proper access rights.
     """
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         logger.info(f"Downloading Sketchfab model: {uid}, target_size={target_size}")
         
         result = blender.send_command("download_sketchfab_model", {
@@ -1091,7 +1101,7 @@ def _process_bbox(original_bbox: list[float] | list[int] | None) -> list[int] | 
 def generate_hyper3d_model_via_text(
     ctx: Context,
     text_prompt: str,
-    bbox_condition: list[float]=None, user_prompt: str = "") -> str:
+    bbox_condition: list[float]=None, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Generate 3D asset using Hyper3D by giving description of the desired asset, and import the asset into Blender.
     The 3D asset has built-in materials.
@@ -1104,7 +1114,7 @@ def generate_hyper3d_model_via_text(
     Returns a message indicating success or failure.
     """
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         result = blender.send_command("create_rodin_job", {
             "text_prompt": text_prompt,
             "images": None,
@@ -1128,7 +1138,7 @@ def generate_hyper3d_model_via_images(
     ctx: Context,
     input_image_paths: list[str]=None,
     input_image_urls: list[str]=None,
-    bbox_condition: list[float]=None, user_prompt: str = "") -> str:
+    bbox_condition: list[float]=None, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Generate 3D asset using Hyper3D by giving images of the wanted asset, and import the generated asset into Blender.
     The 3D asset has built-in materials.
@@ -1160,7 +1170,7 @@ def generate_hyper3d_model_via_images(
             return "Error: not all image URLs are valid!"
         images = input_image_urls.copy()
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         result = blender.send_command("create_rodin_job", {
             "text_prompt": None,
             "images": images,
@@ -1184,7 +1194,7 @@ def poll_rodin_job_status(
     ctx: Context,
     subscription_key: str=None,
     request_id: str=None,
-):
+blender_key: str = ""):
     """
     Check if the Hyper3D Rodin generation task is completed.
 
@@ -1206,7 +1216,7 @@ def poll_rodin_job_status(
         This is a polling API, so only proceed if the status are finally determined ("COMPLETED" or some failed state).
     """
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         kwargs = {}
         if subscription_key:
             kwargs = {
@@ -1229,7 +1239,7 @@ def import_generated_asset(
     name: str,
     task_uuid: str=None,
     request_id: str=None,
-):
+blender_key: str = ""):
     """
     Import the asset generated by Hyper3D Rodin after the generation task is completed.
 
@@ -1242,7 +1252,7 @@ def import_generated_asset(
     Return if the asset has been imported successfully.
     """
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         kwargs = {
             "name": name
         }
@@ -1257,13 +1267,13 @@ def import_generated_asset(
         return f"Error generating Hyper3D task: {str(e)}"
 
 @mcp.tool()
-def get_hunyuan3d_status(ctx: Context, user_prompt: str = "") -> str:
+def get_hunyuan3d_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Check if Hunyuan3D integration is enabled in Blender.
     Returns a message indicating whether Hunyuan3D features are available.
     """
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         result = blender.send_command("get_hunyuan3d_status")
         message = result.get("message", "")
         return message
@@ -1276,7 +1286,7 @@ def get_hunyuan3d_status(ctx: Context, user_prompt: str = "") -> str:
 def generate_hunyuan3d_model(
     ctx: Context,
     text_prompt: str = None,
-    input_image_url: str = None, user_prompt: str = "") -> str:
+    input_image_url: str = None, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Generate 3D asset using Hunyuan3D by providing either text description, image reference, 
     or both for the desired asset, and import the asset into Blender.
@@ -1292,7 +1302,7 @@ def generate_hunyuan3d_model(
     - Returns error message if the operation fails
     """
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         result = blender.send_command("create_hunyuan_job", {
             "text_prompt": text_prompt,
             "image": input_image_url,
@@ -1312,7 +1322,7 @@ def generate_hunyuan3d_model(
 def poll_hunyuan_job_status(
     ctx: Context,
     job_id: str=None,
-):
+blender_key: str = ""):
     """
     Check if the Hunyuan3D generation task is completed.
 
@@ -1327,7 +1337,7 @@ def poll_hunyuan_job_status(
         This is a polling API, so only proceed if the status are finally determined ("DONE" or some failed state).
     """
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         kwargs = {
             "job_id": job_id,
         }
@@ -1343,7 +1353,7 @@ def import_generated_asset_hunyuan(
     ctx: Context,
     name: str,
     zip_file_url: str,
-):
+blender_key: str = ""):
     """
     Import the asset generated by Hunyuan3D after the generation task is completed.
 
@@ -1354,7 +1364,7 @@ def import_generated_asset_hunyuan(
     Return if the asset has been imported successfully.
     """
     try:
-        blender = get_blender_connection(ctx)
+        blender = get_blender_connection(ctx, blender_key)
         kwargs = {
             "name": name
         }
@@ -1371,6 +1381,13 @@ def import_generated_asset_hunyuan(
 def asset_creation_strategy() -> str:
     """Defines the preferred strategy for creating assets in Blender"""
     return """When creating 3D content in Blender, always start by checking if integrations are available:
+
+    **blender_key**: Every Blender tool takes a blender_key parameter identifying which
+    user's Blender to control (this server can be shared by many users, each with their
+    own Blender running locally). If you don't already have this user's key from earlier
+    in the conversation, ask them for it before calling any other Blender tool -- then
+    reuse that exact same value for every Blender tool call for the rest of this
+    conversation. Never guess or reuse a key from a different conversation/user.
 
     0. Before anything, always check the scene from get_scene_info()
     

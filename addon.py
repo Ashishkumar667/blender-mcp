@@ -108,6 +108,20 @@ class BlenderMCPServer:
             "BLENDERMCP_HUNYUAN3D_API_URL",
         ) or "http://localhost:8081"
 
+    def _get_hosted_relay_url(self):
+        return self._get_config_value(
+            "blendermcp_hosted_url",
+            "hosted_relay_url",
+            "BLENDERMCP_HOSTED_URL",
+        )
+
+    def _get_hosted_relay_key(self):
+        return self._get_config_value(
+            "blendermcp_hosted_key",
+            "hosted_relay_key",
+            "BLENDERMCP_HOSTED_KEY",
+        )
+
     def start(self):
         if bpy.app.background:
             print("BlenderMCP: cannot start server in background mode (blender -b) - commands would never execute\n"
@@ -2488,6 +2502,92 @@ class BlenderMCPServer:
                 print(f"Failed to clean up temporary directory {temp_dir}: {e}")
     #endregion
 
+class BlenderMCPHostedRelay:
+    """Connects this Blender instance to a hosted, multi-user BlenderMCP
+    server (e.g. one deployed on a platform like on-demand.io) without
+    opening any inbound port. It repeatedly long-polls the server's
+    /agent/poll endpoint for commands, runs each one through the same
+    execute_command() the local socket server uses, and posts the result
+    back to /agent/respond. Only plain HTTP is used (via the `requests`
+    library this addon already depends on for Poly Haven/Sketchfab), so
+    nothing extra needs installing beyond the addon itself.
+    """
+
+    POLL_TIMEOUT = 35  # a little longer than the server's own poll wait, to avoid spurious read-timeouts
+    RETRY_DELAY = 5
+
+    def __init__(self, server, base_url, key):
+        self.server = server
+        self.base_url = base_url.rstrip('/')
+        self.key = key
+        self.running = False
+        self.thread = None
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self.thread.start()
+        print(f"BlenderMCP: connecting to hosted server at {self.base_url}")
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            try:
+                self.thread.join(timeout=1.0)
+            except Exception:
+                pass
+            self.thread = None
+        print("BlenderMCP: disconnected from hosted server")
+
+    def _poll_loop(self):
+        while self.running:
+            try:
+                resp = requests.get(
+                    f"{self.base_url}/agent/poll",
+                    params={"key": self.key},
+                    headers=REQ_HEADERS,
+                    timeout=self.POLL_TIMEOUT,
+                )
+                resp.raise_for_status()
+                command = resp.json().get("command")
+                if command:
+                    self._run_command(command)
+            except requests.exceptions.RequestException as e:
+                if self.running:
+                    print(f"BlenderMCP: hosted relay poll failed ({e}); retrying in {self.RETRY_DELAY}s")
+                    time.sleep(self.RETRY_DELAY)
+            except Exception as e:
+                if self.running:
+                    print(f"BlenderMCP: unexpected error in hosted relay: {e}")
+                    time.sleep(self.RETRY_DELAY)
+
+    def _run_command(self, command):
+        request_id = command.get("request_id")
+
+        def execute_and_respond():
+            try:
+                response = self.server.execute_command(command)
+            except Exception as e:
+                response = {"status": "error", "message": str(e)}
+            response["request_id"] = request_id
+            try:
+                requests.post(
+                    f"{self.base_url}/agent/respond",
+                    params={"key": self.key},
+                    json=response,
+                    headers=REQ_HEADERS,
+                    timeout=15,
+                )
+            except Exception as e:
+                print(f"BlenderMCP: failed to send a command's result to the hosted server: {e}")
+            return None
+
+        # Blender's data API is only safe to touch from the main thread.
+        bpy.app.timers.register(execute_and_respond, first_interval=0.0)
+
+
 # Blender Addon Preferences
 class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __name__
@@ -2523,6 +2623,17 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
     hunyuan3d_api_url: bpy.props.StringProperty(
         name="Hunyuan3D API URL",
         description="Persistent Hunyuan3D API URL",
+        default=""
+    )
+    hosted_relay_url: bpy.props.StringProperty(
+        name="Hosted Server URL",
+        description="Base URL of the hosted, multi-user BlenderMCP server (e.g. https://your-app.on-demand.io)",
+        default=""
+    )
+    hosted_relay_key: bpy.props.StringProperty(
+        name="Personal Key",
+        subtype="PASSWORD",
+        description="Your personal key -- give the same value to the AI so its Blender tool calls reach this Blender",
         default=""
     )
 
@@ -2617,7 +2728,26 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
         else:
             layout.operator("blendermcp.stop_server", text="Disconnect from MCP server")
             layout.label(text=f"Running on port {scene.blendermcp_port}")
-        
+
+        # Hosted / multi-user connection section
+        layout.separator()
+        hosted_box = layout.box()
+        hcol = hosted_box.column(align=True)
+        hcol.label(text="Hosted Connection (multi-user AI)", icon='WORLD')
+        hcol.label(text="Use this if the AI runs on a shared server, not on this PC.")
+        if prefs:
+            hcol.prop(prefs, "hosted_relay_url", text="Server URL")
+            hcol.prop(prefs, "hosted_relay_key", text="Personal Key")
+        else:
+            hcol.prop(scene, "blendermcp_hosted_url", text="Server URL")
+            hcol.prop(scene, "blendermcp_hosted_key", text="Personal Key")
+
+        if not scene.blendermcp_hosted_running:
+            hcol.operator("blendermcp.start_hosted_relay", text="Connect to Hosted Server")
+        else:
+            hcol.operator("blendermcp.stop_hosted_relay", text="Disconnect from Hosted Server")
+            hcol.label(text="Connected -- give the AI your Personal Key above")
+
         # Feedback section
         layout.separator()
         feedback_box = layout.box()
@@ -2686,6 +2816,54 @@ class BLENDERMCP_OT_StopServer(bpy.types.Operator):
         scene.blendermcp_server_running = False
 
         return {'FINISHED'}
+
+# Operator to connect to a hosted, multi-user BlenderMCP server
+class BLENDERMCP_OT_StartHostedRelay(bpy.types.Operator):
+    bl_idname = "blendermcp.start_hosted_relay"
+    bl_label = "Connect to Hosted Server"
+    bl_description = "Connect this Blender to a hosted BlenderMCP server using your Personal Key"
+
+    def execute(self, context):
+        scene = context.scene
+
+        if not hasattr(bpy.types, "blendermcp_server") or not bpy.types.blendermcp_server:
+            bpy.types.blendermcp_server = BlenderMCPServer(port=scene.blendermcp_port)
+            bpy.types.blendermcp_server.start()
+            scene.blendermcp_server_running = bpy.types.blendermcp_server.running
+
+        base_url = bpy.types.blendermcp_server._get_hosted_relay_url()
+        key = bpy.types.blendermcp_server._get_hosted_relay_key()
+        if not base_url or not key:
+            self.report({'ERROR'}, "Enter both the Server URL and your Personal Key first")
+            return {'CANCELLED'}
+
+        if hasattr(bpy.types, "blendermcp_hosted_relay") and bpy.types.blendermcp_hosted_relay:
+            bpy.types.blendermcp_hosted_relay.stop()
+
+        bpy.types.blendermcp_hosted_relay = BlenderMCPHostedRelay(bpy.types.blendermcp_server, base_url, key)
+        bpy.types.blendermcp_hosted_relay.start()
+        scene.blendermcp_hosted_running = True
+
+        return {'FINISHED'}
+
+
+# Operator to disconnect from a hosted BlenderMCP server
+class BLENDERMCP_OT_StopHostedRelay(bpy.types.Operator):
+    bl_idname = "blendermcp.stop_hosted_relay"
+    bl_label = "Disconnect from Hosted Server"
+    bl_description = "Disconnect this Blender from the hosted BlenderMCP server"
+
+    def execute(self, context):
+        scene = context.scene
+
+        if hasattr(bpy.types, "blendermcp_hosted_relay") and bpy.types.blendermcp_hosted_relay:
+            bpy.types.blendermcp_hosted_relay.stop()
+            del bpy.types.blendermcp_hosted_relay
+
+        scene.blendermcp_hosted_running = False
+
+        return {'FINISHED'}
+
 
 # Operator to open Terms and Conditions
 class BLENDERMCP_OT_OpenTerms(bpy.types.Operator):
@@ -2833,6 +3011,24 @@ def register():
         default=""
     )
 
+    bpy.types.Scene.blendermcp_hosted_url = bpy.props.StringProperty(
+        name="Hosted Server URL",
+        description="Base URL of the hosted, multi-user BlenderMCP server",
+        default=""
+    )
+
+    bpy.types.Scene.blendermcp_hosted_key = bpy.props.StringProperty(
+        name="Personal Key",
+        subtype="PASSWORD",
+        description="Your personal key -- give the same value to the AI so its Blender tool calls reach this Blender",
+        default=""
+    )
+
+    bpy.types.Scene.blendermcp_hosted_running = bpy.props.BoolProperty(
+        name="Hosted Relay Connected",
+        default=False
+    )
+
     # Register preferences class
     bpy.utils.register_class(BLENDERMCP_AddonPreferences)
 
@@ -2840,6 +3036,8 @@ def register():
     bpy.utils.register_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
     bpy.utils.register_class(BLENDERMCP_OT_StartServer)
     bpy.utils.register_class(BLENDERMCP_OT_StopServer)
+    bpy.utils.register_class(BLENDERMCP_OT_StartHostedRelay)
+    bpy.utils.register_class(BLENDERMCP_OT_StopHostedRelay)
     bpy.utils.register_class(BLENDERMCP_OT_OpenTerms)
 
     # Auto-start the server so the MCP client can connect without manual UI interaction
@@ -2863,6 +3061,11 @@ def register():
     print("BlenderMCP addon registered")
 
 def unregister():
+    # Stop the hosted relay if it's running
+    if hasattr(bpy.types, "blendermcp_hosted_relay") and bpy.types.blendermcp_hosted_relay:
+        bpy.types.blendermcp_hosted_relay.stop()
+        del bpy.types.blendermcp_hosted_relay
+
     # Stop the server if it's running
     if hasattr(bpy.types, "blendermcp_server") and bpy.types.blendermcp_server:
         bpy.types.blendermcp_server.stop()
@@ -2872,8 +3075,14 @@ def unregister():
     bpy.utils.unregister_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
     bpy.utils.unregister_class(BLENDERMCP_OT_StartServer)
     bpy.utils.unregister_class(BLENDERMCP_OT_StopServer)
+    bpy.utils.unregister_class(BLENDERMCP_OT_StartHostedRelay)
+    bpy.utils.unregister_class(BLENDERMCP_OT_StopHostedRelay)
     bpy.utils.unregister_class(BLENDERMCP_OT_OpenTerms)
     bpy.utils.unregister_class(BLENDERMCP_AddonPreferences)
+
+    del bpy.types.Scene.blendermcp_hosted_url
+    del bpy.types.Scene.blendermcp_hosted_key
+    del bpy.types.Scene.blendermcp_hosted_running
 
     del bpy.types.Scene.blendermcp_port
     del bpy.types.Scene.blendermcp_server_running
