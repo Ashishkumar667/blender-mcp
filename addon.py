@@ -2505,23 +2505,31 @@ class BlenderMCPServer:
 class BlenderMCPHostedRelay:
     """Connects this Blender instance to a hosted, multi-user BlenderMCP
     server (e.g. one deployed on a platform like on-demand.io) without
-    opening any inbound port. It repeatedly long-polls the server's
-    /agent/poll endpoint for commands, runs each one through the same
-    execute_command() the local socket server uses, and posts the result
-    back to /agent/respond. Only plain HTTP is used (via the `requests`
-    library this addon already depends on for Poly Haven/Sketchfab), so
-    nothing extra needs installing beyond the addon itself.
+    opening any inbound port.
+
+    Some hosting platforms only forward the exact MCP endpoint path
+    (.../mcp) to the container and 404 anything else, so this can't use a
+    separate custom HTTP route -- instead it acts as a minimal MCP client
+    itself, repeatedly calling the server's internal_blender_agent_poll tool
+    through that same /mcp URL, running whatever command comes back through
+    the same execute_command() the local socket server uses, and submitting
+    the result via internal_blender_agent_respond. Only plain HTTP is used
+    (via the `requests` library this addon already depends on for Poly
+    Haven/Sketchfab), so nothing extra needs installing.
     """
 
     POLL_TIMEOUT = 35  # a little longer than the server's own poll wait, to avoid spurious read-timeouts
+    RESPOND_TIMEOUT = 15
+    MAIN_THREAD_TIMEOUT = 175  # give Blender a chance to run a slow command before giving up
     RETRY_DELAY = 5
 
-    def __init__(self, server, base_url, key):
+    def __init__(self, server, mcp_url, key):
         self.server = server
-        self.base_url = base_url.rstrip('/')
+        self.mcp_url = mcp_url
         self.key = key
         self.running = False
         self.thread = None
+        self._next_request_id = 0
 
     def start(self):
         if self.running:
@@ -2529,7 +2537,7 @@ class BlenderMCPHostedRelay:
         self.running = True
         self.thread = threading.Thread(target=self._poll_loop, daemon=True)
         self.thread.start()
-        print(f"BlenderMCP: connecting to hosted server at {self.base_url}")
+        print(f"BlenderMCP: connecting to hosted server at {self.mcp_url}")
 
     def stop(self):
         self.running = False
@@ -2541,17 +2549,56 @@ class BlenderMCPHostedRelay:
             self.thread = None
         print("BlenderMCP: disconnected from hosted server")
 
+    def _call_tool(self, name, arguments, timeout):
+        """Calls one MCP tool on the hosted server via a raw JSON-RPC
+        tools/call request, and returns its structured result as a dict."""
+        self._next_request_id += 1
+        payload = {
+            "jsonrpc": "2.0",
+            "id": self._next_request_id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        }
+        headers = dict(REQ_HEADERS)
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "application/json, text/event-stream"
+
+        resp = requests.post(self.mcp_url, json=payload, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+
+        # The response may be a bare JSON body, or an SSE stream of
+        # "event: message\ndata: {...}\n\n" lines -- handle both.
+        envelope = None
+        for line in resp.text.splitlines():
+            line = line.strip()
+            if line.startswith("data:"):
+                envelope = json.loads(line[len("data:"):].strip())
+                break
+        if envelope is None:
+            envelope = json.loads(resp.text)
+
+        if envelope.get("error"):
+            raise Exception(envelope["error"].get("message", "MCP server returned an error"))
+
+        result = envelope.get("result", {})
+        structured = result.get("structuredContent")
+        if structured is not None:
+            return structured
+        for block in result.get("content") or []:
+            if block.get("type") == "text":
+                try:
+                    return json.loads(block["text"])
+                except json.JSONDecodeError:
+                    return {}
+        return {}
+
     def _poll_loop(self):
         while self.running:
             try:
-                resp = requests.get(
-                    f"{self.base_url}/agent/poll",
-                    params={"key": self.key},
-                    headers=REQ_HEADERS,
-                    timeout=self.POLL_TIMEOUT,
+                data = self._call_tool(
+                    "internal_blender_agent_poll", {"blender_key": self.key}, self.POLL_TIMEOUT
                 )
-                resp.raise_for_status()
-                command = resp.json().get("command")
+                command = data.get("command")
                 if command:
                     self._run_command(command)
             except requests.exceptions.RequestException as e:
@@ -2564,28 +2611,41 @@ class BlenderMCPHostedRelay:
                     time.sleep(self.RETRY_DELAY)
 
     def _run_command(self, command):
+        """Runs one command on Blender's main thread and reports the result
+        back. Called from the background poll thread, so the network calls
+        here are fine -- only execute_command() itself needs the main thread."""
         request_id = command.get("request_id")
+        result_holder = {}
+        done_event = threading.Event()
 
-        def execute_and_respond():
+        def execute_on_main_thread():
             try:
-                response = self.server.execute_command(command)
+                result_holder["response"] = self.server.execute_command(command)
             except Exception as e:
-                response = {"status": "error", "message": str(e)}
-            response["request_id"] = request_id
-            try:
-                requests.post(
-                    f"{self.base_url}/agent/respond",
-                    params={"key": self.key},
-                    json=response,
-                    headers=REQ_HEADERS,
-                    timeout=15,
-                )
-            except Exception as e:
-                print(f"BlenderMCP: failed to send a command's result to the hosted server: {e}")
+                result_holder["response"] = {"status": "error", "message": str(e)}
+            done_event.set()
             return None
 
-        # Blender's data API is only safe to touch from the main thread.
-        bpy.app.timers.register(execute_and_respond, first_interval=0.0)
+        bpy.app.timers.register(execute_on_main_thread, first_interval=0.0)
+        done_event.wait(timeout=self.MAIN_THREAD_TIMEOUT)
+        response = result_holder.get(
+            "response", {"status": "error", "message": "Command timed out waiting for Blender's main thread"}
+        )
+
+        try:
+            self._call_tool(
+                "internal_blender_agent_respond",
+                {
+                    "blender_key": self.key,
+                    "request_id": request_id,
+                    "status": response.get("status", "success"),
+                    "result": response.get("result"),
+                    "message": response.get("message"),
+                },
+                self.RESPOND_TIMEOUT,
+            )
+        except Exception as e:
+            print(f"BlenderMCP: failed to send a command's result to the hosted server: {e}")
 
 
 # Blender Addon Preferences
@@ -2626,8 +2686,11 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         default=""
     )
     hosted_relay_url: bpy.props.StringProperty(
-        name="Hosted Server URL",
-        description="Base URL of the hosted, multi-user BlenderMCP server (e.g. https://your-app.on-demand.io)",
+        name="MCP Server URL",
+        description=(
+            "The exact same MCP URL configured for the AI tool itself "
+            "(e.g. https://mcp.on-demand.io/instances/blender-mcp/mcp?apiKey=...)"
+        ),
         default=""
     )
     hosted_relay_key: bpy.props.StringProperty(
@@ -2735,11 +2798,12 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
         hcol = hosted_box.column(align=True)
         hcol.label(text="Hosted Connection (multi-user AI)", icon='WORLD')
         hcol.label(text="Use this if the AI runs on a shared server, not on this PC.")
+        hcol.label(text="Paste the same MCP URL used for the AI tool itself.")
         if prefs:
-            hcol.prop(prefs, "hosted_relay_url", text="Server URL")
+            hcol.prop(prefs, "hosted_relay_url", text="MCP URL")
             hcol.prop(prefs, "hosted_relay_key", text="Personal Key")
         else:
-            hcol.prop(scene, "blendermcp_hosted_url", text="Server URL")
+            hcol.prop(scene, "blendermcp_hosted_url", text="MCP URL")
             hcol.prop(scene, "blendermcp_hosted_key", text="Personal Key")
 
         if not scene.blendermcp_hosted_running:
@@ -2831,16 +2895,16 @@ class BLENDERMCP_OT_StartHostedRelay(bpy.types.Operator):
             bpy.types.blendermcp_server.start()
             scene.blendermcp_server_running = bpy.types.blendermcp_server.running
 
-        base_url = bpy.types.blendermcp_server._get_hosted_relay_url()
+        mcp_url = bpy.types.blendermcp_server._get_hosted_relay_url()
         key = bpy.types.blendermcp_server._get_hosted_relay_key()
-        if not base_url or not key:
-            self.report({'ERROR'}, "Enter both the Server URL and your Personal Key first")
+        if not mcp_url or not key:
+            self.report({'ERROR'}, "Enter both the MCP Server URL and your Personal Key first")
             return {'CANCELLED'}
 
         if hasattr(bpy.types, "blendermcp_hosted_relay") and bpy.types.blendermcp_hosted_relay:
             bpy.types.blendermcp_hosted_relay.stop()
 
-        bpy.types.blendermcp_hosted_relay = BlenderMCPHostedRelay(bpy.types.blendermcp_server, base_url, key)
+        bpy.types.blendermcp_hosted_relay = BlenderMCPHostedRelay(bpy.types.blendermcp_server, mcp_url, key)
         bpy.types.blendermcp_hosted_relay.start()
         scene.blendermcp_hosted_running = True
 
@@ -3012,8 +3076,8 @@ def register():
     )
 
     bpy.types.Scene.blendermcp_hosted_url = bpy.props.StringProperty(
-        name="Hosted Server URL",
-        description="Base URL of the hosted, multi-user BlenderMCP server",
+        name="MCP Server URL",
+        description="The exact same MCP URL configured for the AI tool itself",
         default=""
     )
 

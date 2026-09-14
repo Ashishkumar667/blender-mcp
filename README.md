@@ -319,15 +319,22 @@ edit its MCP server URL themselves.
 To support that, every Blender tool takes a `blender_key` argument identifying
 whose Blender to control, and the Blender addon itself (`addon.py`) can
 connect outward to the hosted server to receive commands for that key --
-no separate program to install, no inbound port on the user's side.
+no separate program to install, no inbound port on the user's side. It does
+this by acting as a minimal MCP client and calling two internal relay tools
+(`internal_blender_agent_poll` / `internal_blender_agent_respond`) through
+the exact same `/mcp` URL the AI itself uses -- some hosting platforms only
+forward that one path to the container, not an arbitrary custom endpoint,
+so the relay has to travel through it rather than a separate route.
 
 **Setup per user (entirely inside Blender):**
 
 1. Install `addon.py` as usual (see Installation above) and open the
    BlenderMCP sidebar tab.
-2. Under **"Hosted Connection (multi-user AI)"**, enter the Server URL (the
-   hosted deployment's base URL) and a Personal Key (any unique string they
-   choose, e.g. a UUID).
+2. Under **"Hosted Connection (multi-user AI)"**, enter the **MCP URL** --
+   the exact same URL configured for the AI tool itself, including any
+   `?apiKey=...` on the end (e.g.
+   `https://mcp.on-demand.io/instances/blender-mcp/mcp?apiKey=...`) -- and
+   a Personal Key (any unique string they choose, e.g. a UUID).
 3. Click **"Connect to Hosted Server"**.
 4. In their conversation with the shared agent, they tell it their Personal
    Key once (e.g. "my blender key is ..."); the model then supplies that same

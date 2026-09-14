@@ -243,21 +243,22 @@ _polyhaven_enabled = False  # Add this global variable
 # hosted agent (e.g. on a platform like on-demand.io), there is no single
 # BLENDER_HOST/BLENDER_PORT that reaches everyone's Blender -- each user's
 # Blender only exists on their own machine, which isn't reachable from the
-# outside. To support that, the Blender addon itself (addon.py) can connect
-# outward: it repeatedly long-polls this server's /agent/poll endpoint for
-# commands (plain HTTP, so it needs nothing beyond Blender's built-in Python
-# -- no pip install, no separate program), runs whatever command it gets
-# against the local Blender session, and posts the result back to
-# /agent/respond. Each user is identified by a personal "blender_key" that
-# they enter once in the addon's sidebar panel and that the model supplies
-# as the blender_key argument on every Blender tool call (see
-# asset_creation_strategy() below) -- so a call for one user's key is always
-# routed to that same user's addon, never anyone else's.
+# outside. To support that, the Blender addon itself (addon.py) connects
+# outward, acting as a minimal MCP client: it repeatedly calls the
+# internal_blender_agent_poll tool below (through the exact same /mcp
+# endpoint the AI uses -- some hosted platforms, on-demand.io included, only
+# forward that one path and won't route a separate custom endpoint), runs
+# whatever command it gets against the local Blender session, and submits
+# the result via internal_blender_agent_respond. Each user is identified by
+# a personal "blender_key" that they enter once in the addon's sidebar panel
+# and that the model supplies as the blender_key argument on every Blender
+# tool call (see asset_creation_strategy() below) -- so a call for one
+# user's key is always routed to that same user's addon, never anyone else's.
 _main_event_loop: asyncio.AbstractEventLoop = None
 _agent_links: Dict[str, "AgentLink"] = {}
 _agent_links_guard = threading.Lock()
 
-AGENT_POLL_TIMEOUT = 25.0  # how long /agent/poll waits before returning "no command"
+AGENT_POLL_TIMEOUT = 25.0  # how long internal_blender_agent_poll waits before returning "no command"
 AGENT_LINK_IDLE_TTL = 120.0  # drop a key's queued state if nobody has polled in this long
 
 
@@ -306,7 +307,8 @@ async def _send_command_via_agent(key: str, command_type: str, params: Dict[str,
 class RelayBlenderConnection:
     """Same send_command() interface as BlenderConnection, but proxies each
     command to one specific user's local Blender addon through the
-    /agent/poll + /agent/respond relay instead of dialing a fixed host:port."""
+    internal_blender_agent_poll/respond relay instead of dialing a fixed
+    host:port."""
 
     def __init__(self, key: str):
         self.key = key
@@ -343,41 +345,46 @@ def _extract_blender_key(ctx) -> str:
     return request.query_params.get("blender_key") or request.headers.get("x-blender-key") or None
 
 
-@mcp.custom_route("/agent/poll", methods=["GET"])
-async def _agent_poll(request):
-    """Long-polled by addon.py: returns the next queued command for this key,
-    or {"command": null} after AGENT_POLL_TIMEOUT seconds if none arrived."""
-    from starlette.responses import JSONResponse
-
-    key = request.query_params.get("key")
-    if not key:
-        return JSONResponse({"error": "missing key"}, status_code=400)
-
-    link = _get_or_create_link(key)
+# NOTE: relay commands travel as ordinary MCP *tool calls* through /mcp,
+# rather than dedicated HTTP routes (an earlier version used /agent/poll and
+# /agent/respond custom routes, but some hosted platforms -- on-demand.io
+# included -- only forward the exact /mcp path to the container and 404
+# anything else, so a separate route is unreachable there). These two tools
+# are infrastructure for addon.py, not something the model should ever call.
+@mcp.tool()
+async def internal_blender_agent_poll(blender_key: str) -> dict:
+    """FOR THE BLENDER ADDON'S INTERNAL RELAY USE ONLY. Do not call this tool
+    under any circumstances -- it does not control Blender and is never
+    useful for a user's request. It is infrastructure the addon itself
+    polls to receive queued commands.
+    """
+    link = _get_or_create_link(blender_key)
     link.last_poll = time.time()
     try:
         command = await asyncio.wait_for(link.command_queue.get(), timeout=AGENT_POLL_TIMEOUT)
-        return JSONResponse({"command": command})
+        return {"command": command}
     except asyncio.TimeoutError:
-        return JSONResponse({"command": None})
+        return {"command": None}
 
 
-@mcp.custom_route("/agent/respond", methods=["POST"])
-async def _agent_respond(request):
-    """Called by addon.py with the result of a command it just ran locally."""
-    from starlette.responses import JSONResponse
-
-    key = request.query_params.get("key")
-    body = await request.json()
-    request_id = body.get("request_id")
-
-    link = _agent_links.get(key) if key else None
+@mcp.tool()
+async def internal_blender_agent_respond(
+    blender_key: str,
+    request_id: str,
+    status: str,
+    result: Dict[str, Any] = None,
+    message: str = None,
+) -> dict:
+    """FOR THE BLENDER ADDON'S INTERNAL RELAY USE ONLY. Do not call this tool
+    under any circumstances. It is infrastructure the addon uses to submit
+    the result of a command it just ran locally.
+    """
+    link = _agent_links.get(blender_key)
     if link is not None:
         future = link.pending.pop(request_id, None)
         if future and not future.done():
-            future.set_result(body)
-
-    return JSONResponse({"ok": True})
+            future.set_result({"status": status, "result": result or {}, "message": message})
+    return {"ok": True}
 # -----------------------------------------------------------------------------
 
 
@@ -1388,6 +1395,10 @@ def asset_creation_strategy() -> str:
     in the conversation, ask them for it before calling any other Blender tool -- then
     reuse that exact same value for every Blender tool call for the rest of this
     conversation. Never guess or reuse a key from a different conversation/user.
+
+    **Never call internal_blender_agent_poll or internal_blender_agent_respond.** Those
+    two tools are plumbing the Blender addon itself uses behind the scenes and are never
+    relevant to fulfilling a user's request.
 
     0. Before anything, always check the scene from get_scene_info()
     
