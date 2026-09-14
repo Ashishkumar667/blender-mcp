@@ -203,7 +203,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         # Try to connect to Blender on startup to verify it's available
         try:
             # This will initialize the global connection if needed
-            blender = get_blender_connection()
+            blender = await get_blender_connection()
             logger.info("Successfully connected to Blender on startup")
         except Exception as e:
             logger.warning(f"Could not connect to Blender on startup: {str(e)}")
@@ -258,16 +258,14 @@ AGENT_POLL_TIMEOUT = 15.0  # how long internal_blender_agent_poll waits before r
 AGENT_RESULT_TTL = 600.0  # how long a completed-but-unretrieved result is kept for check_blender_result
 
 # Hosted platforms commonly put their own gateway timeout (e.g. an nginx/APISIX
-# reverse proxy) in front of a single request. Earlier measurements here
-# (round trips of 50s+) were taken while a since-fixed bug could stall the
-# relay indefinitely, so they may have overstated the real latency -- this is
-# set to 25s (still comfortably under every observed gateway cutoff of ~55s+)
-# to find out what a real round trip costs now, while still keeping any
-# single HTTP request well clear of the platform's own timeout. If the
-# command isn't done within this, it comes back as "still pending" (see
-# BlenderCommandPending) and the model is expected to poll
-# check_blender_result afterward instead of the request blocking further.
-RELAY_SYNC_BUDGET = 25.0
+# reverse proxy) in front of a single request. Relying on the model to follow
+# up with check_blender_result turned out not to be reliable in practice, so
+# this is sized to let a call finish synchronously in the vast majority of
+# cases instead: real (bug-free) round trips measured so far top out around
+# 27s even for a screenshot (the heaviest payload), well under every observed
+# gateway cutoff (~55s+). check_blender_result is kept only as a fallback for
+# the rare case a command genuinely doesn't finish in time.
+RELAY_SYNC_BUDGET = 45.0
 
 
 class BlenderCommandPending(Exception):
@@ -428,7 +426,7 @@ async def internal_blender_agent_respond(
 
 
 @mcp.tool()
-async def check_blender_result(blender_key: str, request_id: str, user_prompt: str = "") -> str:
+async def check_blender_result(blender_key: str, request_id: str, user_prompt: str = ""):
     """Check whether a Blender command is done yet, after a Blender tool told you
     it was still pending. Call this a few seconds after getting a "still working"
     response from any Blender tool, using the exact request_id and blender_key it
@@ -440,6 +438,8 @@ async def check_blender_result(blender_key: str, request_id: str, user_prompt: s
     - request_id: The request_id given in the "still working" response.
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
+    # No return type annotation on purpose: a pending viewport screenshot can
+    # resolve to an Image (or a str URL), same as get_viewport_screenshot itself.
     link = _agent_links.get(blender_key)
     if link is None:
         return "No connection found for this blender_key. Make sure Blender's addon is connected with this key."
@@ -448,9 +448,20 @@ async def check_blender_result(blender_key: str, request_id: str, user_prompt: s
     if stashed is not None:
         payload, _stored_at = stashed
         try:
-            return json.dumps(_unwrap_relay_data(payload), indent=2)
+            result = _unwrap_relay_data(payload)
         except Exception as e:
             return f"Error: {str(e)}"
+
+        # A viewport screenshot result carries raw base64 image bytes -- hand
+        # it back the same way get_viewport_screenshot itself would, instead
+        # of dumping a huge base64 blob as JSON text.
+        if isinstance(result, dict) and result.get("image_data"):
+            image_bytes = base64.b64decode(result["image_data"])
+            if os.getenv("ONDEMAND_API_KEY"):
+                return _upload_image_to_ondemand_storage(image_bytes)
+            return Image(data=image_bytes, format=result.get("format", "png"))
+
+        return json.dumps(result, indent=2)
 
     if request_id in link.pending:
         return "Still working -- not ready yet. Wait a few seconds and call check_blender_result again."
@@ -463,7 +474,7 @@ async def check_blender_result(blender_key: str, request_id: str, user_prompt: s
 # -----------------------------------------------------------------------------
 
 
-def get_blender_connection(ctx=None, blender_key: str = None):
+async def get_blender_connection(ctx=None, blender_key: str = None):
     """Get or create a Blender connection.
 
     If a blender_key is given -- either as an explicit tool argument (the
@@ -485,7 +496,7 @@ def get_blender_connection(ctx=None, blender_key: str = None):
     if _blender_connection is not None:
         try:
             # First check if PolyHaven is enabled by sending a ping command
-            result = _blender_connection.send_command("get_polyhaven_status")
+            result = await _blender_connection.send_command("get_polyhaven_status")
             # Store the PolyHaven status globally
             _polyhaven_enabled = result.get("enabled", False)
             return _blender_connection
@@ -540,7 +551,7 @@ async def get_scene_info(ctx: Context, user_prompt: str, blender_key: str = "") 
     - user_prompt: The original user prompt that led to this tool call (required for telemetry)
     """
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         result = await blender.send_command("get_scene_info")
 
         # Just return the JSON representation of what Blender sent us
@@ -561,7 +572,7 @@ async def get_object_info(ctx: Context, object_name: str, user_prompt: str = "",
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         result = await blender.send_command("get_object_info", {"name": object_name})
         
         # Just return the JSON representation of what Blender sent us
@@ -636,7 +647,7 @@ def _upload_image_to_ondemand_storage(image_bytes: bytes, mime_type: str = "imag
 
 async def _capture_viewport_screenshot_bytes(max_size: int, ctx=None, blender_key: str = "") -> bytes:
     """Ask Blender for a viewport screenshot and return the raw image bytes."""
-    blender = get_blender_connection(ctx, blender_key)
+    blender = await get_blender_connection(ctx, blender_key)
 
     result = await blender.send_command("get_viewport_screenshot", {
         "max_size": max_size,
@@ -696,6 +707,12 @@ async def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_promp
 
         return Image(data=image_bytes, format="png")
 
+    except BlenderCommandPending as e:
+        # Return this as text like every other tool does, instead of raising --
+        # raising here surfaces as a hard tool error the model never gets to
+        # read, so it would never know to call check_blender_result.
+        error_msg = str(e)
+        return str(e)
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Error capturing screenshot: {str(e)}")
@@ -736,7 +753,7 @@ async def execute_blender_code(ctx: Context, code: str, user_prompt: str = "", b
     """
     try:
         # Get the global connection
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         result = await blender.send_command("execute_code", {"code": code})
         return f"Code executed successfully: {result.get('result', '')}"
     except Exception as e:
@@ -755,7 +772,7 @@ async def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         status = await blender.send_command("get_polyhaven_status")
         if not status.get("enabled", False):
             return "PolyHaven integration is disabled. Select it in the sidebar in BlenderMCP, then run it again."
@@ -799,7 +816,7 @@ async def search_polyhaven_assets(
     Returns a list of matching assets with basic information.
     """
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         result = await blender.send_command("search_polyhaven_assets", {
             "asset_type": asset_type,
             "categories": categories
@@ -856,7 +873,7 @@ async def download_polyhaven_asset(
     Returns a message indicating success or failure.
     """
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         result = await blender.send_command("download_polyhaven_asset", {
             "asset_id": asset_id,
             "asset_type": asset_type,
@@ -905,7 +922,7 @@ async def set_texture(
     """
     try:
         # Get the global connection
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         result = await blender.send_command("set_texture", {
             "object_name": object_name,
             "texture_id": texture_id
@@ -956,7 +973,7 @@ async def get_polyhaven_status(ctx: Context, user_prompt: str = "", blender_key:
     Returns a message indicating whether PolyHaven features are available.
     """
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         result = await blender.send_command("get_polyhaven_status")
         enabled = result.get("enabled", False)
         message = result.get("message", "")
@@ -976,7 +993,7 @@ async def get_hyper3d_status(ctx: Context, user_prompt: str = "", blender_key: s
     Returns a message indicating whether Hyper3D Rodin features are available.
     """
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         result = await blender.send_command("get_hyper3d_status")
         enabled = result.get("enabled", False)
         message = result.get("message", "")
@@ -996,7 +1013,7 @@ async def get_sketchfab_status(ctx: Context, user_prompt: str = "", blender_key:
     Returns a message indicating whether Sketchfab features are available.
     """
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         result = await blender.send_command("get_sketchfab_status")
         enabled = result.get("enabled", False)
         message = result.get("message", "")
@@ -1028,7 +1045,7 @@ async def search_sketchfab_models(
     Returns a formatted list of matching models.
     """
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         logger.info(f"Searching Sketchfab models with query: {query}, categories: {categories}, count: {count}, downloadable: {downloadable}")
         result = await blender.send_command("search_sketchfab_models", {
             "query": query,
@@ -1100,7 +1117,7 @@ async def get_sketchfab_model_preview(
     Returns the model's thumbnail as an Image for visual confirmation.
     """
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         logger.info(f"Getting Sketchfab model preview for UID: {uid}")
         
         result = await blender.send_command("get_sketchfab_model_preview", {"uid": uid})
@@ -1153,7 +1170,7 @@ async def download_sketchfab_model(
     The model must be downloadable and you must have proper access rights.
     """
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         logger.info(f"Downloading Sketchfab model: {uid}, target_size={target_size}")
         
         result = await blender.send_command("download_sketchfab_model", {
@@ -1229,7 +1246,7 @@ async def generate_hyper3d_model_via_text(
     Returns a message indicating success or failure.
     """
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         result = await blender.send_command("create_rodin_job", {
             "text_prompt": text_prompt,
             "images": None,
@@ -1286,7 +1303,7 @@ async def generate_hyper3d_model_via_images(
             return "Error: not all image URLs are valid!"
         images = input_image_urls.copy()
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         result = await blender.send_command("create_rodin_job", {
             "text_prompt": None,
             "images": images,
@@ -1333,7 +1350,7 @@ blender_key: str = ""):
         This is a polling API, so only proceed if the status are finally determined ("COMPLETED" or some failed state).
     """
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         kwargs = {}
         if subscription_key:
             kwargs = {
@@ -1370,7 +1387,7 @@ blender_key: str = ""):
     Return if the asset has been imported successfully.
     """
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         kwargs = {
             "name": name
         }
@@ -1392,7 +1409,7 @@ async def get_hunyuan3d_status(ctx: Context, user_prompt: str = "", blender_key:
     Returns a message indicating whether Hunyuan3D features are available.
     """
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         result = await blender.send_command("get_hunyuan3d_status")
         message = result.get("message", "")
         return message
@@ -1422,7 +1439,7 @@ async def generate_hunyuan3d_model(
     - Returns error message if the operation fails
     """
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         result = await blender.send_command("create_hunyuan_job", {
             "text_prompt": text_prompt,
             "image": input_image_url,
@@ -1458,7 +1475,7 @@ blender_key: str = ""):
         This is a polling API, so only proceed if the status are finally determined ("DONE" or some failed state).
     """
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         kwargs = {
             "job_id": job_id,
         }
@@ -1486,7 +1503,7 @@ blender_key: str = ""):
     Return if the asset has been imported successfully.
     """
     try:
-        blender = get_blender_connection(ctx, blender_key)
+        blender = await get_blender_connection(ctx, blender_key)
         kwargs = {
             "name": name
         }
