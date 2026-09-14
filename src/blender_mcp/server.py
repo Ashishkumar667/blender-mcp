@@ -260,28 +260,55 @@ _agent_links: Dict[str, "AgentLink"] = {}
 _agent_links_guard = threading.Lock()
 
 AGENT_POLL_TIMEOUT = 15.0  # how long internal_blender_agent_poll waits before returning "no command"
-AGENT_LINK_IDLE_TTL = 120.0  # drop a key's queued state if nobody has polled in this long
+AGENT_RESULT_TTL = 600.0  # how long a completed-but-unretrieved result is kept for check_blender_result
 
 # Hosted platforms commonly put their own gateway timeout (e.g. an nginx/APISIX
-# reverse proxy) in front of the container, well under a minute in practice --
-# a command that takes longer than that gets killed by the gateway with an
-# opaque 504 instead of ever reaching this timeout. Kept under that so a
-# slow/disconnected addon fails with a clear message instead. (Measured against
-# on-demand.io: a real successful round trip landed around 53s, and the
-# gateway's own cutoff was observed between 53s and 64s -- 55s aims for
-# comfortably above the former and under the latter, but this may need
-# further tuning if round trips vary.)
-AGENT_RESPONSE_TIMEOUT = 55.0
+# reverse proxy) in front of a single request, and on-demand.io's real-world
+# round trips (addon poll + execute + addon respond) have been measured
+# anywhere from ~15s to 60s+ -- too long and too variable to safely block a
+# single tool call on. So a tool call only waits this briefly for a fast
+# answer; if the command isn't done yet it comes back as "still pending"
+# (see BlenderCommandPending) instead, and the model is expected to poll
+# check_blender_result afterward. This keeps every single HTTP request short
+# regardless of how slow the underlying relay round trip actually is.
+RELAY_SYNC_BUDGET = 8.0
+
+
+class BlenderCommandPending(Exception):
+    """Raised when a relay command hasn't finished within RELAY_SYNC_BUDGET.
+    Not a failure -- the command is still queued/running. The message itself
+    carries the follow-up instructions so it reads sensibly even if caught by
+    a plain `except Exception` that just does str(e)."""
+
+    def __init__(self, request_id: str, blender_key: str):
+        self.request_id = request_id
+        self.blender_key = blender_key
+        super().__init__(
+            "Blender is still working on this command on the hosted relay (this can take a while, "
+            "and is not a failure). Wait a few seconds, then call check_blender_result with "
+            f"request_id='{request_id}' and blender_key='{blender_key}' to get the actual result. "
+            "If it's still not ready, call check_blender_result again after another few seconds."
+        )
 
 
 class AgentLink:
     """Per-user relay state: commands waiting to be picked up by that user's
-    addon, and futures awaiting the addon's response to an in-flight command."""
+    addon, futures awaiting the addon's response to an in-flight command, and
+    completed results not yet claimed by check_blender_result."""
 
     def __init__(self):
         self.command_queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
         self.pending: Dict[str, asyncio.Future] = {}
+        self.results: Dict[str, Dict[str, Any]] = {}  # request_id -> (payload, stored_at)
         self.last_poll = 0.0
+
+    def stash_result(self, request_id: str, payload: Dict[str, Any]):
+        now = time.time()
+        # Opportunistic cleanup of old unclaimed results so this can't grow forever.
+        stale = [rid for rid, (_, stored_at) in self.results.items() if now - stored_at > AGENT_RESULT_TTL]
+        for rid in stale:
+            self.results.pop(rid, None)
+        self.results[request_id] = (payload, now)
 
 
 def _get_or_create_link(key: str) -> "AgentLink":
@@ -302,15 +329,16 @@ async def _send_command_via_agent(key: str, command_type: str, params: Dict[str,
     await link.command_queue.put({"request_id": request_id, "type": command_type, "params": params or {}})
 
     try:
-        data = await asyncio.wait_for(future, timeout=AGENT_RESPONSE_TIMEOUT)
+        data = await asyncio.wait_for(future, timeout=RELAY_SYNC_BUDGET)
     except asyncio.TimeoutError:
-        raise Exception(
-            f"No response from the Blender addon for key '{key}' within {int(AGENT_RESPONSE_TIMEOUT)}s. "
-            "Make sure Blender is open with this same key entered in the BlenderMCP sidebar panel and connected."
-        )
+        return {"__pending__": True, "request_id": request_id}
     finally:
         link.pending.pop(request_id, None)
 
+    return {"__pending__": False, "data": data}
+
+
+def _unwrap_relay_data(data: Dict[str, Any]) -> Dict[str, Any]:
     if data.get("status") == "error":
         raise Exception(data.get("message", "Unknown error from Blender"))
     return data.get("result", {})
@@ -320,7 +348,8 @@ class RelayBlenderConnection:
     """Same send_command() interface as BlenderConnection, but proxies each
     command to one specific user's local Blender addon through the
     internal_blender_agent_poll/respond relay instead of dialing a fixed
-    host:port."""
+    host:port. If the addon doesn't answer within RELAY_SYNC_BUDGET, raises
+    BlenderCommandPending instead of blocking further -- see check_blender_result."""
 
     def __init__(self, key: str):
         self.key = key
@@ -332,16 +361,17 @@ class RelayBlenderConnection:
             _send_command_via_agent(self.key, command_type, params or {}),
             _main_event_loop,
         )
-        outer_timeout = AGENT_RESPONSE_TIMEOUT + 5.0
+        outer_timeout = RELAY_SYNC_BUDGET + 5.0
         try:
-            return future.result(timeout=outer_timeout)
+            outcome = future.result(timeout=outer_timeout)
         except FutureTimeoutError:
             # concurrent.futures.TimeoutError stringifies to "" with no args,
             # which otherwise surfaces as a blank, useless error message.
-            raise Exception(
-                f"No response from the Blender addon for key '{self.key}' within {int(outer_timeout)}s. "
-                "Make sure Blender is open with this same key entered in the BlenderMCP sidebar panel and connected."
-            )
+            raise Exception(f"Relay scheduling error for key '{self.key}' (timed out after {int(outer_timeout)}s)")
+
+        if outcome["__pending__"]:
+            raise BlenderCommandPending(outcome["request_id"], self.key)
+        return _unwrap_relay_data(outcome["data"])
 
     def disconnect(self):
         pass
@@ -402,10 +432,51 @@ async def internal_blender_agent_respond(
     """
     link = _agent_links.get(blender_key)
     if link is not None:
+        payload = {"status": status, "result": result or {}, "message": message}
         future = link.pending.pop(request_id, None)
         if future and not future.done():
-            future.set_result({"status": status, "result": result or {}, "message": message})
+            future.set_result(payload)
+        else:
+            # The original tool call already gave up waiting (it only waits
+            # RELAY_SYNC_BUDGET seconds) -- stash it so check_blender_result
+            # can still retrieve it once it's asked for.
+            link.stash_result(request_id, payload)
     return {"ok": True}
+
+
+@mcp.tool()
+async def check_blender_result(blender_key: str, request_id: str, user_prompt: str = "") -> str:
+    """Check whether a Blender command is done yet, after a Blender tool told you
+    it was still pending. Call this a few seconds after getting a "still working"
+    response from any Blender tool, using the exact request_id and blender_key it
+    gave you. If this says it's still not ready, wait a few more seconds and call
+    it again -- do not treat "not ready yet" as a failure.
+
+    Parameters:
+    - blender_key: The same blender_key from the original Blender tool call.
+    - request_id: The request_id given in the "still working" response.
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    link = _agent_links.get(blender_key)
+    if link is None:
+        return "No connection found for this blender_key. Make sure Blender's addon is connected with this key."
+
+    stashed = link.results.pop(request_id, None)
+    if stashed is not None:
+        payload, _stored_at = stashed
+        try:
+            return json.dumps(_unwrap_relay_data(payload), indent=2)
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+    if request_id in link.pending:
+        return "Still working -- not ready yet. Wait a few seconds and call check_blender_result again."
+
+    return (
+        "Unknown request_id: either it was already retrieved with an earlier "
+        "check_blender_result call, or the addon hasn't picked it up yet -- wait a "
+        "few seconds and try again."
+    )
 # -----------------------------------------------------------------------------
 
 
@@ -1420,6 +1491,13 @@ def asset_creation_strategy() -> str:
     **Never call internal_blender_agent_poll or internal_blender_agent_respond.** Those
     two tools are plumbing the Blender addon itself uses behind the scenes and are never
     relevant to fulfilling a user's request.
+
+    **If a Blender tool says it's still working / pending**: this happens when Blender is
+    reached through the hosted relay, which can be slow. It is NOT a failure. The response
+    will give you a request_id and blender_key -- wait a few seconds, then call
+    check_blender_result with those same values. If it says "still working" again, wait a
+    few more seconds and call it again. Keep doing this until you get the real result (or a
+    real error) before telling the user anything failed.
 
     0. Before anything, always check the scene from get_scene_info()
     
