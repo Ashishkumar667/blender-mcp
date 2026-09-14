@@ -258,15 +258,16 @@ AGENT_POLL_TIMEOUT = 15.0  # how long internal_blender_agent_poll waits before r
 AGENT_RESULT_TTL = 600.0  # how long a completed-but-unretrieved result is kept for check_blender_result
 
 # Hosted platforms commonly put their own gateway timeout (e.g. an nginx/APISIX
-# reverse proxy) in front of a single request, and on-demand.io's real-world
-# round trips (addon poll + execute + addon respond) have been measured
-# anywhere from ~15s to 60s+ -- too long and too variable to safely block a
-# single tool call on. So a tool call only waits this briefly for a fast
-# answer; if the command isn't done yet it comes back as "still pending"
-# (see BlenderCommandPending) instead, and the model is expected to poll
-# check_blender_result afterward. This keeps every single HTTP request short
-# regardless of how slow the underlying relay round trip actually is.
-RELAY_SYNC_BUDGET = 8.0
+# reverse proxy) in front of a single request. Earlier measurements here
+# (round trips of 50s+) were taken while a since-fixed bug could stall the
+# relay indefinitely, so they may have overstated the real latency -- this is
+# set to 25s (still comfortably under every observed gateway cutoff of ~55s+)
+# to find out what a real round trip costs now, while still keeping any
+# single HTTP request well clear of the platform's own timeout. If the
+# command isn't done within this, it comes back as "still pending" (see
+# BlenderCommandPending) and the model is expected to poll
+# check_blender_result afterward instead of the request blocking further.
+RELAY_SYNC_BUDGET = 25.0
 
 
 class BlenderCommandPending(Exception):
@@ -511,8 +512,27 @@ def get_blender_connection(ctx=None, blender_key: str = None):
     return _blender_connection
 
 
+_PENDING_RESULT_NOTICE = (
+    "\n\nIMPORTANT: this tool can return a 'still working' response instead of the "
+    "real result, when Blender is reached through the hosted multi-user relay (this "
+    "is common, not a failure). That response includes a request_id and blender_key. "
+    "If you see it, you MUST call check_blender_result with those exact values, and "
+    "keep calling it every few seconds until it returns the real result -- do not stop "
+    "or tell the user this failed just because of a 'still working' response."
+)
+
+
+def _with_pending_notice(func):
+    """Appends relay-pending instructions to a tool's own description, so the
+    model sees them on every call instead of only in a one-off error message."""
+    if func.__doc__:
+        func.__doc__ = func.__doc__ + _PENDING_RESULT_NOTICE
+    return func
+
+
 @mcp.tool()
 @telemetry_tool("get_scene_info")
+@_with_pending_notice
 async def get_scene_info(ctx: Context, user_prompt: str, blender_key: str = "") -> str:
     """Get detailed information about the current Blender scene
 
@@ -531,6 +551,7 @@ async def get_scene_info(ctx: Context, user_prompt: str, blender_key: str = "") 
 
 @mcp.tool()
 @telemetry_tool("get_object_info")
+@_with_pending_notice
 async def get_object_info(ctx: Context, object_name: str, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Get detailed information about a specific object in the Blender scene.
@@ -636,6 +657,7 @@ async def _capture_viewport_screenshot_bytes(max_size: int, ctx=None, blender_ke
 
 
 @mcp.tool()
+@_with_pending_notice
 async def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str = "", blender_key: str = ""):
     """
     Capture a screenshot of the current Blender 3D viewport.
@@ -703,6 +725,7 @@ async def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_promp
 
 @mcp.tool()
 @rich_telemetry_tool("execute_blender_code", capture_code=True)
+@_with_pending_notice
 async def execute_blender_code(ctx: Context, code: str, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Execute arbitrary Python code in Blender. Make sure to do it step-by-step by breaking it into smaller chunks.
@@ -722,6 +745,7 @@ async def execute_blender_code(ctx: Context, code: str, user_prompt: str = "", b
 
 @mcp.tool()
 @telemetry_tool("get_polyhaven_categories")
+@_with_pending_notice
 async def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user_prompt: str = "", blender_key: str = "") -> str:
     """
     Get a list of categories for a specific asset type on Polyhaven.
@@ -757,6 +781,7 @@ async def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user
 
 @mcp.tool()
 @telemetry_tool("search_polyhaven_assets")
+@_with_pending_notice
 async def search_polyhaven_assets(
     ctx: Context,
     asset_type: str = "all",
@@ -809,6 +834,7 @@ async def search_polyhaven_assets(
 
 @mcp.tool()
 @rich_telemetry_tool("download_polyhaven_asset")
+@_with_pending_notice
 async def download_polyhaven_asset(
     ctx: Context,
     asset_id: str,
@@ -863,6 +889,7 @@ async def download_polyhaven_asset(
 
 @mcp.tool()
 @telemetry_tool("set_texture")
+@_with_pending_notice
 async def set_texture(
     ctx: Context,
     object_name: str,
@@ -922,6 +949,7 @@ async def set_texture(
 
 @mcp.tool()
 @telemetry_tool("get_polyhaven_status")
+@_with_pending_notice
 async def get_polyhaven_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Check if PolyHaven integration is enabled in Blender.
@@ -941,6 +969,7 @@ async def get_polyhaven_status(ctx: Context, user_prompt: str = "", blender_key:
 
 @mcp.tool()
 @telemetry_tool("get_hyper3d_status")
+@_with_pending_notice
 async def get_hyper3d_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Check if Hyper3D Rodin integration is enabled in Blender.
@@ -960,6 +989,7 @@ async def get_hyper3d_status(ctx: Context, user_prompt: str = "", blender_key: s
 
 @mcp.tool()
 @telemetry_tool("get_sketchfab_status")
+@_with_pending_notice
 async def get_sketchfab_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Check if Sketchfab integration is enabled in Blender.
@@ -979,6 +1009,7 @@ async def get_sketchfab_status(ctx: Context, user_prompt: str = "", blender_key:
 
 @mcp.tool()
 @telemetry_tool("search_sketchfab_models")
+@_with_pending_notice
 async def search_sketchfab_models(
     ctx: Context,
     query: str,
@@ -1055,6 +1086,7 @@ async def search_sketchfab_models(
 
 @mcp.tool()
 @telemetry_tool("download_sketchfab_model")
+@_with_pending_notice
 async def get_sketchfab_model_preview(
     ctx: Context,
     uid: str, user_prompt: str = "", blender_key: str = "") -> Image:
@@ -1097,6 +1129,7 @@ async def get_sketchfab_model_preview(
 
 @mcp.tool()
 @rich_telemetry_tool("download_sketchfab_model")
+@_with_pending_notice
 async def download_sketchfab_model(
     ctx: Context,
     uid: str,
@@ -1179,6 +1212,7 @@ def _process_bbox(original_bbox: list[float] | list[int] | None) -> list[int] | 
 
 @mcp.tool()
 @rich_telemetry_tool("generate_hyper3d_model_via_text")
+@_with_pending_notice
 async def generate_hyper3d_model_via_text(
     ctx: Context,
     text_prompt: str,
@@ -1215,6 +1249,7 @@ async def generate_hyper3d_model_via_text(
 
 @mcp.tool()
 @rich_telemetry_tool("generate_hyper3d_model_via_images")
+@_with_pending_notice
 async def generate_hyper3d_model_via_images(
     ctx: Context,
     input_image_paths: list[str]=None,
@@ -1271,6 +1306,7 @@ async def generate_hyper3d_model_via_images(
 
 @mcp.tool()
 @telemetry_tool("poll_rodin_job_status")
+@_with_pending_notice
 async def poll_rodin_job_status(
     ctx: Context,
     subscription_key: str=None,
@@ -1315,6 +1351,7 @@ blender_key: str = ""):
 
 @mcp.tool()
 @rich_telemetry_tool("import_generated_asset")
+@_with_pending_notice
 async def import_generated_asset(
     ctx: Context,
     name: str,
@@ -1348,6 +1385,7 @@ blender_key: str = ""):
         return f"Error generating Hyper3D task: {str(e)}"
 
 @mcp.tool()
+@_with_pending_notice
 async def get_hunyuan3d_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Check if Hunyuan3D integration is enabled in Blender.
@@ -1364,6 +1402,7 @@ async def get_hunyuan3d_status(ctx: Context, user_prompt: str = "", blender_key:
     
 @mcp.tool()
 @rich_telemetry_tool("generate_hunyuan3d_model")
+@_with_pending_notice
 async def generate_hunyuan3d_model(
     ctx: Context,
     text_prompt: str = None,
@@ -1400,6 +1439,7 @@ async def generate_hunyuan3d_model(
         return f"Error generating Hunyuan3D task: {str(e)}"
     
 @mcp.tool()
+@_with_pending_notice
 async def poll_hunyuan_job_status(
     ctx: Context,
     job_id: str=None,
@@ -1430,6 +1470,7 @@ blender_key: str = ""):
 
 @mcp.tool()
 @rich_telemetry_tool("import_generated_asset_hunyuan")
+@_with_pending_notice
 async def import_generated_asset_hunyuan(
     ctx: Context,
     name: str,
