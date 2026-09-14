@@ -6,6 +6,7 @@ import asyncio
 import threading
 import time
 import logging
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import tempfile
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
@@ -264,9 +265,13 @@ AGENT_LINK_IDLE_TTL = 120.0  # drop a key's queued state if nobody has polled in
 # Hosted platforms commonly put their own gateway timeout (e.g. an nginx/APISIX
 # reverse proxy) in front of the container, well under a minute in practice --
 # a command that takes longer than that gets killed by the gateway with an
-# opaque 504 instead of ever reaching this timeout. Kept well under that so a
-# slow/disconnected addon fails with a clear message instead.
-AGENT_RESPONSE_TIMEOUT = 45.0
+# opaque 504 instead of ever reaching this timeout. Kept under that so a
+# slow/disconnected addon fails with a clear message instead. (Measured against
+# on-demand.io: a real successful round trip landed around 53s, and the
+# gateway's own cutoff was observed between 53s and 64s -- 55s aims for
+# comfortably above the former and under the latter, but this may need
+# further tuning if round trips vary.)
+AGENT_RESPONSE_TIMEOUT = 55.0
 
 
 class AgentLink:
@@ -327,7 +332,16 @@ class RelayBlenderConnection:
             _send_command_via_agent(self.key, command_type, params or {}),
             _main_event_loop,
         )
-        return future.result(timeout=AGENT_RESPONSE_TIMEOUT + 5.0)
+        outer_timeout = AGENT_RESPONSE_TIMEOUT + 5.0
+        try:
+            return future.result(timeout=outer_timeout)
+        except FutureTimeoutError:
+            # concurrent.futures.TimeoutError stringifies to "" with no args,
+            # which otherwise surfaces as a blank, useless error message.
+            raise Exception(
+                f"No response from the Blender addon for key '{self.key}' within {int(outer_timeout)}s. "
+                "Make sure Blender is open with this same key entered in the BlenderMCP sidebar panel and connected."
+            )
 
     def disconnect(self):
         pass
