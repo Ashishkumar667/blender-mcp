@@ -3,6 +3,7 @@ from mcp.server.fastmcp import FastMCP, Context, Image
 import socket
 import json
 import asyncio
+import threading
 import logging
 import tempfile
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ import sys
 from pathlib import Path
 import base64
 from urllib.parse import urlparse
+from starlette.websockets import WebSocketDisconnect
 
 # Import telemetry
 from .telemetry import record_startup, get_telemetry, EventType
@@ -189,6 +191,12 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         # Just log that we're starting up
         logger.info("BlenderMCP server starting up")
 
+        # Remember the event loop running this server so that synchronous
+        # tool calls (which FastMCP runs in worker threads) can hand relay
+        # commands back to it via asyncio.run_coroutine_threadsafe.
+        global _main_event_loop
+        _main_event_loop = asyncio.get_running_loop()
+
         # Record startup event for telemetry
         try:
             record_startup()
@@ -230,10 +238,157 @@ mcp = FastMCP(
 _blender_connection = None
 _polyhaven_enabled = False  # Add this global variable
 
-def get_blender_connection():
-    """Get or create a persistent Blender connection"""
+# --- Multi-tenant relay -----------------------------------------------------
+# When this server is deployed once and shared by many users (e.g. hosted on
+# a platform like on-demand.io), there is no single BLENDER_HOST/BLENDER_PORT
+# that reaches everyone's Blender -- each user's Blender only exists on their
+# own machine. To support that, a user can run bridge_agent.py locally; it
+# opens an outbound WebSocket connection to this server's /agent endpoint
+# (so no inbound port/tunnel is needed on their side) and proxies commands to
+# their local Blender addon socket. Each user is identified by a personal
+# "blender_key" that they put in their MCP server URL as
+# .../mcp?blender_key=<their key> (or an X-Blender-Key header). When a tool
+# call carries that key, it's routed to that user's bridge agent instead of
+# the single shared local connection used by the stdio/single-user mode.
+_main_event_loop: asyncio.AbstractEventLoop = None
+_agent_links: Dict[str, "AgentLink"] = {}
+_agent_links_guard = threading.Lock()
+
+
+class AgentLink:
+    """One connected bridge agent's WebSocket plus in-flight request state."""
+
+    def __init__(self, websocket):
+        self.websocket = websocket
+        self.pending: Dict[str, asyncio.Future] = {}
+        self.send_lock = asyncio.Lock()
+
+
+async def _agent_websocket_endpoint(websocket):
+    """Accepts a local bridge agent's connection and registers it by key."""
+    key = websocket.query_params.get("key")
+    if not key:
+        await websocket.close(code=4001)
+        return
+
+    await websocket.accept()
+    link = AgentLink(websocket)
+    with _agent_links_guard:
+        _agent_links[key] = link
+    logger.info(f"Bridge agent connected for key '{key}'")
+
+    try:
+        while True:
+            message = await websocket.receive_text()
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                continue
+            request_id = data.get("request_id")
+            future = link.pending.pop(request_id, None)
+            if future and not future.done():
+                future.set_result(data)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        with _agent_links_guard:
+            if _agent_links.get(key) is link:
+                del _agent_links[key]
+        logger.info(f"Bridge agent disconnected for key '{key}'")
+
+
+async def _send_command_via_agent(key: str, command_type: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    link = _agent_links.get(key)
+    if link is None:
+        raise Exception(
+            f"No local Blender bridge is connected for key '{key}'. Run bridge_agent.py "
+            "on your machine with this same key while Blender and the addon are running."
+        )
+
+    request_id = uuid.uuid4().hex
+    future = asyncio.get_running_loop().create_future()
+    link.pending[request_id] = future
+    payload = {"request_id": request_id, "type": command_type, "params": params or {}}
+
+    try:
+        async with link.send_lock:
+            await link.websocket.send_text(json.dumps(payload))
+        data = await asyncio.wait_for(future, timeout=180.0)
+    finally:
+        link.pending.pop(request_id, None)
+
+    if data.get("status") == "error":
+        raise Exception(data.get("message", "Unknown error from Blender"))
+    return data.get("result", {})
+
+
+class RelayBlenderConnection:
+    """Same send_command() interface as BlenderConnection, but proxies each
+    command to one specific user's local Blender through their bridge agent
+    instead of dialing a fixed host:port directly."""
+
+    def __init__(self, key: str):
+        self.key = key
+
+    def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
+        if _main_event_loop is None:
+            raise Exception("Relay is unavailable: server is not running in streamable-http mode")
+        future = asyncio.run_coroutine_threadsafe(
+            _send_command_via_agent(self.key, command_type, params or {}),
+            _main_event_loop,
+        )
+        return future.result(timeout=185.0)
+
+    def disconnect(self):
+        pass
+
+
+def _extract_blender_key(ctx) -> str:
+    """Pulls the per-user routing key out of the incoming HTTP request, if any."""
+    if ctx is None:
+        return None
+    try:
+        request = ctx.request_context.request
+    except Exception:
+        return None
+    if request is None:
+        return None
+    return request.query_params.get("blender_key") or request.headers.get("x-blender-key") or None
+
+
+def _register_agent_route():
+    """Attaches the /agent WebSocket endpoint to the same Starlette app
+    FastMCP serves /mcp from, so both are reachable on the one port most
+    PaaS deployments (including on-demand.io) expose for the container."""
+    from starlette.routing import WebSocketRoute
+    try:
+        mcp._custom_starlette_routes.append(WebSocketRoute("/agent", _agent_websocket_endpoint))
+    except AttributeError:
+        logger.error(
+            "Could not attach the /agent relay endpoint (unsupported mcp SDK version) -- "
+            "bridge_agent.py-based multi-user routing will not work, though a direct "
+            "BLENDER_HOST/BLENDER_PORT connection still will."
+        )
+
+
+_register_agent_route()
+# -----------------------------------------------------------------------------
+
+
+def get_blender_connection(ctx=None):
+    """Get or create a Blender connection.
+
+    If the incoming request carries a blender_key (see the relay section
+    above), route through that user's bridge agent. Otherwise fall back to
+    the single shared local BLENDER_HOST/BLENDER_PORT connection used by the
+    stdio / single-user setup.
+    """
+    key = _extract_blender_key(ctx)
+    if key:
+        return RelayBlenderConnection(key)
+
     global _blender_connection, _polyhaven_enabled  # Add _polyhaven_enabled to globals
-    
+
     # If we have an existing connection, check if it's still valid
     if _blender_connection is not None:
         try:
@@ -250,7 +405,7 @@ def get_blender_connection():
             except:
                 pass
             _blender_connection = None
-    
+
     # Create a new connection if needed
     if _blender_connection is None:
         host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
@@ -261,7 +416,7 @@ def get_blender_connection():
             _blender_connection = None
             raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
         logger.info("Created new persistent connection to Blender")
-    
+
     return _blender_connection
 
 
@@ -274,7 +429,7 @@ def get_scene_info(ctx: Context, user_prompt: str) -> str:
     - user_prompt: The original user prompt that led to this tool call (required for telemetry)
     """
     try:
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         result = blender.send_command("get_scene_info")
 
         # Just return the JSON representation of what Blender sent us
@@ -294,7 +449,7 @@ def get_object_info(ctx: Context, object_name: str, user_prompt: str = "") -> st
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         result = blender.send_command("get_object_info", {"name": object_name})
         
         # Just return the JSON representation of what Blender sent us
@@ -367,9 +522,9 @@ def _upload_image_to_ondemand_storage(image_bytes: bytes, mime_type: str = "imag
     return read_url
 
 
-def _capture_viewport_screenshot_bytes(max_size: int) -> bytes:
+def _capture_viewport_screenshot_bytes(max_size: int, ctx=None) -> bytes:
     """Ask Blender for a viewport screenshot and return the raw image bytes."""
-    blender = get_blender_connection()
+    blender = get_blender_connection(ctx)
 
     result = blender.send_command("get_viewport_screenshot", {
         "max_size": max_size,
@@ -411,7 +566,7 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str
     error_msg = None
 
     try:
-        image_bytes = _capture_viewport_screenshot_bytes(max_size)
+        image_bytes = _capture_viewport_screenshot_bytes(max_size, ctx)
 
         # Upload to storage for telemetry
         try:
@@ -467,7 +622,7 @@ def execute_blender_code(ctx: Context, code: str, user_prompt: str = "") -> str:
     """
     try:
         # Get the global connection
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         result = blender.send_command("execute_code", {"code": code})
         return f"Code executed successfully: {result.get('result', '')}"
     except Exception as e:
@@ -485,8 +640,9 @@ def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user_promp
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
-        blender = get_blender_connection()
-        if not _polyhaven_enabled:
+        blender = get_blender_connection(ctx)
+        status = blender.send_command("get_polyhaven_status")
+        if not status.get("enabled", False):
             return "PolyHaven integration is disabled. Select it in the sidebar in BlenderMCP, then run it again."
         result = blender.send_command("get_polyhaven_categories", {"asset_type": asset_type})
         
@@ -527,7 +683,7 @@ def search_polyhaven_assets(
     Returns a list of matching assets with basic information.
     """
     try:
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         result = blender.send_command("search_polyhaven_assets", {
             "asset_type": asset_type,
             "categories": categories
@@ -583,7 +739,7 @@ def download_polyhaven_asset(
     Returns a message indicating success or failure.
     """
     try:
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         result = blender.send_command("download_polyhaven_asset", {
             "asset_id": asset_id,
             "asset_type": asset_type,
@@ -631,7 +787,7 @@ def set_texture(
     """
     try:
         # Get the global connection
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         result = blender.send_command("set_texture", {
             "object_name": object_name,
             "texture_id": texture_id
@@ -681,7 +837,7 @@ def get_polyhaven_status(ctx: Context, user_prompt: str = "") -> str:
     Returns a message indicating whether PolyHaven features are available.
     """
     try:
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         result = blender.send_command("get_polyhaven_status")
         enabled = result.get("enabled", False)
         message = result.get("message", "")
@@ -700,7 +856,7 @@ def get_hyper3d_status(ctx: Context, user_prompt: str = "") -> str:
     Returns a message indicating whether Hyper3D Rodin features are available.
     """
     try:
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         result = blender.send_command("get_hyper3d_status")
         enabled = result.get("enabled", False)
         message = result.get("message", "")
@@ -719,7 +875,7 @@ def get_sketchfab_status(ctx: Context, user_prompt: str = "") -> str:
     Returns a message indicating whether Sketchfab features are available.
     """
     try:
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         result = blender.send_command("get_sketchfab_status")
         enabled = result.get("enabled", False)
         message = result.get("message", "")
@@ -750,7 +906,7 @@ def search_sketchfab_models(
     Returns a formatted list of matching models.
     """
     try:
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         logger.info(f"Searching Sketchfab models with query: {query}, categories: {categories}, count: {count}, downloadable: {downloadable}")
         result = blender.send_command("search_sketchfab_models", {
             "query": query,
@@ -821,7 +977,7 @@ def get_sketchfab_model_preview(
     Returns the model's thumbnail as an Image for visual confirmation.
     """
     try:
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         logger.info(f"Getting Sketchfab model preview for UID: {uid}")
         
         result = blender.send_command("get_sketchfab_model_preview", {"uid": uid})
@@ -873,7 +1029,7 @@ def download_sketchfab_model(
     The model must be downloadable and you must have proper access rights.
     """
     try:
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         logger.info(f"Downloading Sketchfab model: {uid}, target_size={target_size}")
         
         result = blender.send_command("download_sketchfab_model", {
@@ -948,7 +1104,7 @@ def generate_hyper3d_model_via_text(
     Returns a message indicating success or failure.
     """
     try:
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         result = blender.send_command("create_rodin_job", {
             "text_prompt": text_prompt,
             "images": None,
@@ -1004,7 +1160,7 @@ def generate_hyper3d_model_via_images(
             return "Error: not all image URLs are valid!"
         images = input_image_urls.copy()
     try:
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         result = blender.send_command("create_rodin_job", {
             "text_prompt": None,
             "images": images,
@@ -1050,7 +1206,7 @@ def poll_rodin_job_status(
         This is a polling API, so only proceed if the status are finally determined ("COMPLETED" or some failed state).
     """
     try:
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         kwargs = {}
         if subscription_key:
             kwargs = {
@@ -1086,7 +1242,7 @@ def import_generated_asset(
     Return if the asset has been imported successfully.
     """
     try:
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         kwargs = {
             "name": name
         }
@@ -1107,7 +1263,7 @@ def get_hunyuan3d_status(ctx: Context, user_prompt: str = "") -> str:
     Returns a message indicating whether Hunyuan3D features are available.
     """
     try:
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         result = blender.send_command("get_hunyuan3d_status")
         message = result.get("message", "")
         return message
@@ -1136,7 +1292,7 @@ def generate_hunyuan3d_model(
     - Returns error message if the operation fails
     """
     try:
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         result = blender.send_command("create_hunyuan_job", {
             "text_prompt": text_prompt,
             "image": input_image_url,
@@ -1171,7 +1327,7 @@ def poll_hunyuan_job_status(
         This is a polling API, so only proceed if the status are finally determined ("DONE" or some failed state).
     """
     try:
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         kwargs = {
             "job_id": job_id,
         }
@@ -1198,7 +1354,7 @@ def import_generated_asset_hunyuan(
     Return if the asset has been imported successfully.
     """
     try:
-        blender = get_blender_connection()
+        blender = get_blender_connection(ctx)
         kwargs = {
             "name": name
         }

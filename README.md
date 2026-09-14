@@ -307,6 +307,42 @@ For headless setups or CI, credentials can also be injected by environment varia
 - `BLENDERMCP_HUNYUAN3D_SECRET_KEY`
 - `BLENDERMCP_HUNYUAN3D_API_URL`
 
+## Hosting BlenderMCP for multiple users (e.g. on-demand.io)
+
+Normally the MCP server and Blender run on the same machine, so `BLENDER_HOST`/
+`BLENDER_PORT` just point at `localhost`. That breaks down once you deploy
+this server once and share it with other people (for example as a hosted
+tool on a platform like on-demand.io): the server has no way to reach into
+any individual user's computer, since a random person's Blender install
+isn't reachable from the outside.
+
+To support that case, this server can act as a relay. Each user runs a small
+local script, [`bridge_agent.py`](bridge_agent.py), next to their own
+Blender. It connects *outward* to the hosted server (no inbound port needed
+on the user's side) and forwards commands to their local Blender addon.
+
+**Setup per user:**
+
+1. Pick a personal key (any unique string, e.g. a UUID).
+2. Run the bridge agent locally, with Blender open and the addon's "Connect
+   to Claude" button pressed:
+   ```bash
+   pip install websockets
+   python bridge_agent.py --relay-url wss://<your-hosted-server>/agent --key YOUR_KEY
+   ```
+3. Configure the MCP tool (in the on-demand.io playground, or any MCP
+   client) with the server URL set to:
+   ```
+   https://<your-hosted-server>/mcp?blender_key=YOUR_KEY
+   ```
+
+As long as the bridge agent keeps running, tool calls made with that
+`blender_key` are routed to that user's own Blender. Different users just
+need different keys — no shared config, no manually exposing a TCP port.
+
+This mode requires the server to run with `MCP_TRANSPORT=streamable-http`
+(already the default in the provided `Dockerfile`).
+
 ## Troubleshooting
 
 - **Connection issues**: Make sure the Blender addon server is running, and the MCP server is configured on Claude, DO NOT run the uvx command in the terminal. Sometimes, the first command won't go through but after that it starts working.
