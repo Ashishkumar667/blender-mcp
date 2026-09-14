@@ -6,7 +6,6 @@ import asyncio
 import threading
 import time
 import logging
-from concurrent.futures import TimeoutError as FutureTimeoutError
 import tempfile
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
@@ -127,8 +126,11 @@ class BlenderConnection:
         else:
             raise Exception("No data received")
 
-    def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Send a command to Blender and return the response"""
+    async def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Send a command to Blender and return the response, without blocking the event loop."""
+        return await asyncio.to_thread(self._send_command_sync, command_type, params)
+
+    def _send_command_sync(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
         if not self.sock and not self.connect():
             raise ConnectionError("Not connected to Blender")
         
@@ -192,12 +194,6 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         # Just log that we're starting up
         logger.info("BlenderMCP server starting up")
 
-        # Remember the event loop running this server so that synchronous
-        # tool calls (which FastMCP runs in worker threads) can hand relay
-        # commands back to it via asyncio.run_coroutine_threadsafe.
-        global _main_event_loop
-        _main_event_loop = asyncio.get_running_loop()
-
         # Record startup event for telemetry
         try:
             record_startup()
@@ -255,7 +251,6 @@ _polyhaven_enabled = False  # Add this global variable
 # and that the model supplies as the blender_key argument on every Blender
 # tool call (see asset_creation_strategy() below) -- so a call for one
 # user's key is always routed to that same user's addon, never anyone else's.
-_main_event_loop: asyncio.AbstractEventLoop = None
 _agent_links: Dict[str, "AgentLink"] = {}
 _agent_links_guard = threading.Lock()
 
@@ -354,21 +349,8 @@ class RelayBlenderConnection:
     def __init__(self, key: str):
         self.key = key
 
-    def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
-        if _main_event_loop is None:
-            raise Exception("Relay is unavailable: server is not running in streamable-http mode")
-        future = asyncio.run_coroutine_threadsafe(
-            _send_command_via_agent(self.key, command_type, params or {}),
-            _main_event_loop,
-        )
-        outer_timeout = RELAY_SYNC_BUDGET + 5.0
-        try:
-            outcome = future.result(timeout=outer_timeout)
-        except FutureTimeoutError:
-            # concurrent.futures.TimeoutError stringifies to "" with no args,
-            # which otherwise surfaces as a blank, useless error message.
-            raise Exception(f"Relay scheduling error for key '{self.key}' (timed out after {int(outer_timeout)}s)")
-
+    async def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
+        outcome = await _send_command_via_agent(self.key, command_type, params or {})
         if outcome["__pending__"]:
             raise BlenderCommandPending(outcome["request_id"], self.key)
         return _unwrap_relay_data(outcome["data"])
@@ -531,7 +513,7 @@ def get_blender_connection(ctx=None, blender_key: str = None):
 
 @mcp.tool()
 @telemetry_tool("get_scene_info")
-def get_scene_info(ctx: Context, user_prompt: str, blender_key: str = "") -> str:
+async def get_scene_info(ctx: Context, user_prompt: str, blender_key: str = "") -> str:
     """Get detailed information about the current Blender scene
 
     Parameters:
@@ -539,7 +521,7 @@ def get_scene_info(ctx: Context, user_prompt: str, blender_key: str = "") -> str
     """
     try:
         blender = get_blender_connection(ctx, blender_key)
-        result = blender.send_command("get_scene_info")
+        result = await blender.send_command("get_scene_info")
 
         # Just return the JSON representation of what Blender sent us
         return json.dumps(result, indent=2)
@@ -549,7 +531,7 @@ def get_scene_info(ctx: Context, user_prompt: str, blender_key: str = "") -> str
 
 @mcp.tool()
 @telemetry_tool("get_object_info")
-def get_object_info(ctx: Context, object_name: str, user_prompt: str = "", blender_key: str = "") -> str:
+async def get_object_info(ctx: Context, object_name: str, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Get detailed information about a specific object in the Blender scene.
 
@@ -559,7 +541,7 @@ def get_object_info(ctx: Context, object_name: str, user_prompt: str = "", blend
     """
     try:
         blender = get_blender_connection(ctx, blender_key)
-        result = blender.send_command("get_object_info", {"name": object_name})
+        result = await blender.send_command("get_object_info", {"name": object_name})
         
         # Just return the JSON representation of what Blender sent us
         return json.dumps(result, indent=2)
@@ -631,11 +613,11 @@ def _upload_image_to_ondemand_storage(image_bytes: bytes, mime_type: str = "imag
     return read_url
 
 
-def _capture_viewport_screenshot_bytes(max_size: int, ctx=None, blender_key: str = "") -> bytes:
+async def _capture_viewport_screenshot_bytes(max_size: int, ctx=None, blender_key: str = "") -> bytes:
     """Ask Blender for a viewport screenshot and return the raw image bytes."""
     blender = get_blender_connection(ctx, blender_key)
 
-    result = blender.send_command("get_viewport_screenshot", {
+    result = await blender.send_command("get_viewport_screenshot", {
         "max_size": max_size,
         "format": "png"
     })
@@ -654,7 +636,7 @@ def _capture_viewport_screenshot_bytes(max_size: int, ctx=None, blender_key: str
 
 
 @mcp.tool()
-def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str = "", blender_key: str = ""):
+async def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str = "", blender_key: str = ""):
     """
     Capture a screenshot of the current Blender 3D viewport.
 
@@ -675,7 +657,7 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str
     error_msg = None
 
     try:
-        image_bytes = _capture_viewport_screenshot_bytes(max_size, ctx, blender_key)
+        image_bytes = await _capture_viewport_screenshot_bytes(max_size, ctx, blender_key)
 
         # Upload to storage for telemetry
         try:
@@ -721,7 +703,7 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str
 
 @mcp.tool()
 @rich_telemetry_tool("execute_blender_code", capture_code=True)
-def execute_blender_code(ctx: Context, code: str, user_prompt: str = "", blender_key: str = "") -> str:
+async def execute_blender_code(ctx: Context, code: str, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Execute arbitrary Python code in Blender. Make sure to do it step-by-step by breaking it into smaller chunks.
 
@@ -732,7 +714,7 @@ def execute_blender_code(ctx: Context, code: str, user_prompt: str = "", blender
     try:
         # Get the global connection
         blender = get_blender_connection(ctx, blender_key)
-        result = blender.send_command("execute_code", {"code": code})
+        result = await blender.send_command("execute_code", {"code": code})
         return f"Code executed successfully: {result.get('result', '')}"
     except Exception as e:
         logger.error(f"Error executing code: {str(e)}")
@@ -740,7 +722,7 @@ def execute_blender_code(ctx: Context, code: str, user_prompt: str = "", blender
 
 @mcp.tool()
 @telemetry_tool("get_polyhaven_categories")
-def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user_prompt: str = "", blender_key: str = "") -> str:
+async def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user_prompt: str = "", blender_key: str = "") -> str:
     """
     Get a list of categories for a specific asset type on Polyhaven.
 
@@ -750,10 +732,10 @@ def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user_promp
     """
     try:
         blender = get_blender_connection(ctx, blender_key)
-        status = blender.send_command("get_polyhaven_status")
+        status = await blender.send_command("get_polyhaven_status")
         if not status.get("enabled", False):
             return "PolyHaven integration is disabled. Select it in the sidebar in BlenderMCP, then run it again."
-        result = blender.send_command("get_polyhaven_categories", {"asset_type": asset_type})
+        result = await blender.send_command("get_polyhaven_categories", {"asset_type": asset_type})
         
         if "error" in result:
             return f"Error: {result['error']}"
@@ -775,7 +757,7 @@ def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user_promp
 
 @mcp.tool()
 @telemetry_tool("search_polyhaven_assets")
-def search_polyhaven_assets(
+async def search_polyhaven_assets(
     ctx: Context,
     asset_type: str = "all",
     categories: str = None,
@@ -793,7 +775,7 @@ def search_polyhaven_assets(
     """
     try:
         blender = get_blender_connection(ctx, blender_key)
-        result = blender.send_command("search_polyhaven_assets", {
+        result = await blender.send_command("search_polyhaven_assets", {
             "asset_type": asset_type,
             "categories": categories
         })
@@ -827,7 +809,7 @@ def search_polyhaven_assets(
 
 @mcp.tool()
 @rich_telemetry_tool("download_polyhaven_asset")
-def download_polyhaven_asset(
+async def download_polyhaven_asset(
     ctx: Context,
     asset_id: str,
     asset_type: str,
@@ -849,7 +831,7 @@ def download_polyhaven_asset(
     """
     try:
         blender = get_blender_connection(ctx, blender_key)
-        result = blender.send_command("download_polyhaven_asset", {
+        result = await blender.send_command("download_polyhaven_asset", {
             "asset_id": asset_id,
             "asset_type": asset_type,
             "resolution": resolution,
@@ -881,7 +863,7 @@ def download_polyhaven_asset(
 
 @mcp.tool()
 @telemetry_tool("set_texture")
-def set_texture(
+async def set_texture(
     ctx: Context,
     object_name: str,
     texture_id: str, user_prompt: str = "", blender_key: str = "") -> str:
@@ -897,7 +879,7 @@ def set_texture(
     try:
         # Get the global connection
         blender = get_blender_connection(ctx, blender_key)
-        result = blender.send_command("set_texture", {
+        result = await blender.send_command("set_texture", {
             "object_name": object_name,
             "texture_id": texture_id
         })
@@ -940,14 +922,14 @@ def set_texture(
 
 @mcp.tool()
 @telemetry_tool("get_polyhaven_status")
-def get_polyhaven_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
+async def get_polyhaven_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Check if PolyHaven integration is enabled in Blender.
     Returns a message indicating whether PolyHaven features are available.
     """
     try:
         blender = get_blender_connection(ctx, blender_key)
-        result = blender.send_command("get_polyhaven_status")
+        result = await blender.send_command("get_polyhaven_status")
         enabled = result.get("enabled", False)
         message = result.get("message", "")
         if enabled:
@@ -959,14 +941,14 @@ def get_polyhaven_status(ctx: Context, user_prompt: str = "", blender_key: str =
 
 @mcp.tool()
 @telemetry_tool("get_hyper3d_status")
-def get_hyper3d_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
+async def get_hyper3d_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Check if Hyper3D Rodin integration is enabled in Blender.
     Returns a message indicating whether Hyper3D Rodin features are available.
     """
     try:
         blender = get_blender_connection(ctx, blender_key)
-        result = blender.send_command("get_hyper3d_status")
+        result = await blender.send_command("get_hyper3d_status")
         enabled = result.get("enabled", False)
         message = result.get("message", "")
         if enabled:
@@ -978,14 +960,14 @@ def get_hyper3d_status(ctx: Context, user_prompt: str = "", blender_key: str = "
 
 @mcp.tool()
 @telemetry_tool("get_sketchfab_status")
-def get_sketchfab_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
+async def get_sketchfab_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Check if Sketchfab integration is enabled in Blender.
     Returns a message indicating whether Sketchfab features are available.
     """
     try:
         blender = get_blender_connection(ctx, blender_key)
-        result = blender.send_command("get_sketchfab_status")
+        result = await blender.send_command("get_sketchfab_status")
         enabled = result.get("enabled", False)
         message = result.get("message", "")
         if enabled:
@@ -997,7 +979,7 @@ def get_sketchfab_status(ctx: Context, user_prompt: str = "", blender_key: str =
 
 @mcp.tool()
 @telemetry_tool("search_sketchfab_models")
-def search_sketchfab_models(
+async def search_sketchfab_models(
     ctx: Context,
     query: str,
     categories: str = None,
@@ -1017,7 +999,7 @@ def search_sketchfab_models(
     try:
         blender = get_blender_connection(ctx, blender_key)
         logger.info(f"Searching Sketchfab models with query: {query}, categories: {categories}, count: {count}, downloadable: {downloadable}")
-        result = blender.send_command("search_sketchfab_models", {
+        result = await blender.send_command("search_sketchfab_models", {
             "query": query,
             "categories": categories,
             "count": count,
@@ -1073,7 +1055,7 @@ def search_sketchfab_models(
 
 @mcp.tool()
 @telemetry_tool("download_sketchfab_model")
-def get_sketchfab_model_preview(
+async def get_sketchfab_model_preview(
     ctx: Context,
     uid: str, user_prompt: str = "", blender_key: str = "") -> Image:
     """
@@ -1089,7 +1071,7 @@ def get_sketchfab_model_preview(
         blender = get_blender_connection(ctx, blender_key)
         logger.info(f"Getting Sketchfab model preview for UID: {uid}")
         
-        result = blender.send_command("get_sketchfab_model_preview", {"uid": uid})
+        result = await blender.send_command("get_sketchfab_model_preview", {"uid": uid})
         
         if result is None:
             raise Exception("Received no response from Blender")
@@ -1115,7 +1097,7 @@ def get_sketchfab_model_preview(
 
 @mcp.tool()
 @rich_telemetry_tool("download_sketchfab_model")
-def download_sketchfab_model(
+async def download_sketchfab_model(
     ctx: Context,
     uid: str,
     target_size: float, user_prompt: str = "", blender_key: str = "") -> str:
@@ -1141,7 +1123,7 @@ def download_sketchfab_model(
         blender = get_blender_connection(ctx, blender_key)
         logger.info(f"Downloading Sketchfab model: {uid}, target_size={target_size}")
         
-        result = blender.send_command("download_sketchfab_model", {
+        result = await blender.send_command("download_sketchfab_model", {
             "uid": uid,
             "normalize_size": True,  # Always normalize
             "target_size": target_size
@@ -1197,7 +1179,7 @@ def _process_bbox(original_bbox: list[float] | list[int] | None) -> list[int] | 
 
 @mcp.tool()
 @rich_telemetry_tool("generate_hyper3d_model_via_text")
-def generate_hyper3d_model_via_text(
+async def generate_hyper3d_model_via_text(
     ctx: Context,
     text_prompt: str,
     bbox_condition: list[float]=None, user_prompt: str = "", blender_key: str = "") -> str:
@@ -1214,7 +1196,7 @@ def generate_hyper3d_model_via_text(
     """
     try:
         blender = get_blender_connection(ctx, blender_key)
-        result = blender.send_command("create_rodin_job", {
+        result = await blender.send_command("create_rodin_job", {
             "text_prompt": text_prompt,
             "images": None,
             "bbox_condition": _process_bbox(bbox_condition),
@@ -1233,7 +1215,7 @@ def generate_hyper3d_model_via_text(
 
 @mcp.tool()
 @rich_telemetry_tool("generate_hyper3d_model_via_images")
-def generate_hyper3d_model_via_images(
+async def generate_hyper3d_model_via_images(
     ctx: Context,
     input_image_paths: list[str]=None,
     input_image_urls: list[str]=None,
@@ -1270,7 +1252,7 @@ def generate_hyper3d_model_via_images(
         images = input_image_urls.copy()
     try:
         blender = get_blender_connection(ctx, blender_key)
-        result = blender.send_command("create_rodin_job", {
+        result = await blender.send_command("create_rodin_job", {
             "text_prompt": None,
             "images": images,
             "bbox_condition": _process_bbox(bbox_condition),
@@ -1289,7 +1271,7 @@ def generate_hyper3d_model_via_images(
 
 @mcp.tool()
 @telemetry_tool("poll_rodin_job_status")
-def poll_rodin_job_status(
+async def poll_rodin_job_status(
     ctx: Context,
     subscription_key: str=None,
     request_id: str=None,
@@ -1325,7 +1307,7 @@ blender_key: str = ""):
             kwargs = {
                 "request_id": request_id,
             }
-        result = blender.send_command("poll_rodin_job_status", kwargs)
+        result = await blender.send_command("poll_rodin_job_status", kwargs)
         return result
     except Exception as e:
         logger.error(f"Error generating Hyper3D task: {str(e)}")
@@ -1333,7 +1315,7 @@ blender_key: str = ""):
 
 @mcp.tool()
 @rich_telemetry_tool("import_generated_asset")
-def import_generated_asset(
+async def import_generated_asset(
     ctx: Context,
     name: str,
     task_uuid: str=None,
@@ -1359,21 +1341,21 @@ blender_key: str = ""):
             kwargs["task_uuid"] = task_uuid
         elif request_id:
             kwargs["request_id"] = request_id
-        result = blender.send_command("import_generated_asset", kwargs)
+        result = await blender.send_command("import_generated_asset", kwargs)
         return result
     except Exception as e:
         logger.error(f"Error generating Hyper3D task: {str(e)}")
         return f"Error generating Hyper3D task: {str(e)}"
 
 @mcp.tool()
-def get_hunyuan3d_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
+async def get_hunyuan3d_status(ctx: Context, user_prompt: str = "", blender_key: str = "") -> str:
     """
     Check if Hunyuan3D integration is enabled in Blender.
     Returns a message indicating whether Hunyuan3D features are available.
     """
     try:
         blender = get_blender_connection(ctx, blender_key)
-        result = blender.send_command("get_hunyuan3d_status")
+        result = await blender.send_command("get_hunyuan3d_status")
         message = result.get("message", "")
         return message
     except Exception as e:
@@ -1382,7 +1364,7 @@ def get_hunyuan3d_status(ctx: Context, user_prompt: str = "", blender_key: str =
     
 @mcp.tool()
 @rich_telemetry_tool("generate_hunyuan3d_model")
-def generate_hunyuan3d_model(
+async def generate_hunyuan3d_model(
     ctx: Context,
     text_prompt: str = None,
     input_image_url: str = None, user_prompt: str = "", blender_key: str = "") -> str:
@@ -1402,7 +1384,7 @@ def generate_hunyuan3d_model(
     """
     try:
         blender = get_blender_connection(ctx, blender_key)
-        result = blender.send_command("create_hunyuan_job", {
+        result = await blender.send_command("create_hunyuan_job", {
             "text_prompt": text_prompt,
             "image": input_image_url,
         })
@@ -1418,7 +1400,7 @@ def generate_hunyuan3d_model(
         return f"Error generating Hunyuan3D task: {str(e)}"
     
 @mcp.tool()
-def poll_hunyuan_job_status(
+async def poll_hunyuan_job_status(
     ctx: Context,
     job_id: str=None,
 blender_key: str = ""):
@@ -1440,7 +1422,7 @@ blender_key: str = ""):
         kwargs = {
             "job_id": job_id,
         }
-        result = blender.send_command("poll_hunyuan_job_status", kwargs)
+        result = await blender.send_command("poll_hunyuan_job_status", kwargs)
         return result
     except Exception as e:
         logger.error(f"Error generating Hunyuan3D task: {str(e)}")
@@ -1448,7 +1430,7 @@ blender_key: str = ""):
 
 @mcp.tool()
 @rich_telemetry_tool("import_generated_asset_hunyuan")
-def import_generated_asset_hunyuan(
+async def import_generated_asset_hunyuan(
     ctx: Context,
     name: str,
     zip_file_url: str,
@@ -1469,7 +1451,7 @@ blender_key: str = ""):
         }
         if zip_file_url:
             kwargs["zip_file_url"] = zip_file_url
-        result = blender.send_command("import_generated_asset_hunyuan", kwargs)
+        result = await blender.send_command("import_generated_asset_hunyuan", kwargs)
         return result
     except Exception as e:
         logger.error(f"Error generating Hunyuan3D task: {str(e)}")
