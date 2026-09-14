@@ -258,8 +258,15 @@ _main_event_loop: asyncio.AbstractEventLoop = None
 _agent_links: Dict[str, "AgentLink"] = {}
 _agent_links_guard = threading.Lock()
 
-AGENT_POLL_TIMEOUT = 25.0  # how long internal_blender_agent_poll waits before returning "no command"
+AGENT_POLL_TIMEOUT = 15.0  # how long internal_blender_agent_poll waits before returning "no command"
 AGENT_LINK_IDLE_TTL = 120.0  # drop a key's queued state if nobody has polled in this long
+
+# Hosted platforms commonly put their own gateway timeout (e.g. an nginx/APISIX
+# reverse proxy) in front of the container, well under a minute in practice --
+# a command that takes longer than that gets killed by the gateway with an
+# opaque 504 instead of ever reaching this timeout. Kept well under that so a
+# slow/disconnected addon fails with a clear message instead.
+AGENT_RESPONSE_TIMEOUT = 45.0
 
 
 class AgentLink:
@@ -290,11 +297,11 @@ async def _send_command_via_agent(key: str, command_type: str, params: Dict[str,
     await link.command_queue.put({"request_id": request_id, "type": command_type, "params": params or {}})
 
     try:
-        data = await asyncio.wait_for(future, timeout=180.0)
+        data = await asyncio.wait_for(future, timeout=AGENT_RESPONSE_TIMEOUT)
     except asyncio.TimeoutError:
         raise Exception(
-            f"No response from the Blender addon for key '{key}' within 180s. Make sure Blender "
-            "is open with this same key entered in the BlenderMCP sidebar panel and connected."
+            f"No response from the Blender addon for key '{key}' within {int(AGENT_RESPONSE_TIMEOUT)}s. "
+            "Make sure Blender is open with this same key entered in the BlenderMCP sidebar panel and connected."
         )
     finally:
         link.pending.pop(request_id, None)
@@ -320,7 +327,7 @@ class RelayBlenderConnection:
             _send_command_via_agent(self.key, command_type, params or {}),
             _main_event_loop,
         )
-        return future.result(timeout=185.0)
+        return future.result(timeout=AGENT_RESPONSE_TIMEOUT + 5.0)
 
     def disconnect(self):
         pass

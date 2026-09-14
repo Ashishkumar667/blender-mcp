@@ -2518,9 +2518,13 @@ class BlenderMCPHostedRelay:
     Haven/Sketchfab), so nothing extra needs installing.
     """
 
-    POLL_TIMEOUT = 35  # a little longer than the server's own poll wait, to avoid spurious read-timeouts
-    RESPOND_TIMEOUT = 15
-    MAIN_THREAD_TIMEOUT = 175  # give Blender a chance to run a slow command before giving up
+    # Hosted platforms commonly sit a gateway (nginx/APISIX/etc.) in front of
+    # the server with its own timeout well under a minute. These are kept
+    # with generous margin under that so a slow network hiccup shows up as a
+    # clean retry instead of a client-side read timeout.
+    POLL_TIMEOUT = 40  # server itself only waits ~15s (AGENT_POLL_TIMEOUT); this is margin for network/gateway overhead
+    RESPOND_TIMEOUT = 20
+    MAIN_THREAD_TIMEOUT = 30  # server gives up waiting for a response after ~45s (AGENT_RESPONSE_TIMEOUT); stay under that
     RETRY_DELAY = 5
 
     def __init__(self, server, mcp_url, key):
