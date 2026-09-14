@@ -285,11 +285,14 @@ class BlenderCommandPending(Exception):
         self.request_id = request_id
         self.blender_key = blender_key
         super().__init__(
-            "Blender is still working on this command on the hosted relay (this can take a while, "
-            "and is not a failure). Wait a few seconds, then call check_blender_result with "
-            f"relay_request_id='{request_id}' (NOT any Hyper3D/Rodin request_id or subscription_key -- "
-            f"this is a different, relay-specific id) and blender_key='{blender_key}' to get the actual "
-            "result. If it's still not ready, call check_blender_result again after another few seconds."
+            "Blender is still working on this command (this is normal on the hosted relay "
+            "and is NOT a failure -- do not tell the user it failed). "
+            "You MUST follow up: wait about 5 seconds, then call the check_blender_result tool with "
+            f"exactly these arguments: relay_request_id='{request_id}', blender_key='{blender_key}'. "
+            "If check_blender_result replies 'Still working', wait a few more seconds and call it "
+            "again with the same arguments. Repeat until it returns the real result or a real error. "
+            "NOTE: this relay_request_id is a relay round-trip id only -- it is NOT a Hyper3D/Rodin "
+            "task_uuid, subscription_key, or request_id, do not mix them up."
         )
 
 
@@ -438,31 +441,67 @@ async def internal_blender_agent_respond(
 
 
 @mcp.tool()
-async def check_blender_result(blender_key: str, relay_request_id: str, user_prompt: str = ""):
-    """Check whether a Blender command is done yet, after a Blender tool told you
-    it was still pending. Call this a few seconds after getting a "still working"
-    response from any Blender tool, using the exact relay_request_id and blender_key
-    it gave you. If this says it's still not ready, wait a few more seconds and call
-    it again -- do not treat "not ready yet" as a failure.
+async def check_blender_result(
+    ctx: Context,
+    relay_request_id: str = "",
+    blender_key: str = "",
+    request_id: str = "",
+    user_prompt: str = "",
+):
+    """Retrieve the finished result of a pending Blender command (relay polling follow-up).
 
-    IMPORTANT: relay_request_id is NOT the same thing as a Hyper3D/Rodin task_uuid,
-    subscription_key, or request_id (used by generate_hyper3d_model_via_text/images,
-    poll_rodin_job_status, import_generated_asset). Those identify a Hyper3D
-    generation job and can take minutes on their own -- this relay_request_id only
-    identifies one relay round trip through the hosted server and is unrelated.
+    Call this ONLY after one of the Blender tools (for example get_viewport_screenshot,
+    get_scene_info, execute_blender_code) replied "Blender is still working" and gave you
+    a relay_request_id. That reply is NOT a failure -- the command is still running in the
+    user's Blender. Wait about 5 seconds, then call this tool with the SAME relay_request_id
+    and blender_key. If this tool replies "Still working", wait a few more seconds and call
+    it again with the same values. Keep polling until it returns the real result or a real
+    error -- never report failure to the user just because the first call was still working.
 
-    Parameters:
-    - blender_key: The same blender_key from the original Blender tool call.
-    - relay_request_id: The relay_request_id given in the "still working" response.
-    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    Arguments:
+    - relay_request_id: (required) the exact relay_request_id from the "still working"
+      message. If you only have a field called request_id with a long hex value from that
+      same message, pass it here -- or pass it as request_id, both are accepted.
+    - blender_key: (required) the exact same blender_key used in the original Blender tool
+      call. Ask the user for it if you don't have it; do not guess.
+    - request_id: (optional alias) accepted as a fallback name for relay_request_id, in
+      case you misremember the parameter name. Prefer relay_request_id.
+    - user_prompt: (optional) the original user request, for telemetry.
+
+    Do NOT confuse relay_request_id with Hyper3D/Rodin identifiers (task_uuid,
+    subscription_key, or the request_id used by poll_rodin_job_status and
+    import_generated_asset). Those belong to 3D-generation jobs and are unrelated to this
+    relay polling id.
     """
     # No return type annotation on purpose: a pending viewport screenshot can
     # resolve to an Image (or a str URL), same as get_viewport_screenshot itself.
-    link = _agent_links.get(blender_key)
-    if link is None:
-        return "No connection found for this blender_key. Make sure Blender's addon is connected with this key."
+    def _clean_arg(value) -> str:
+        return str(value).strip() if value else ""
 
-    stashed = link.results.pop(relay_request_id, None)
+    effective_request_id = _clean_arg(relay_request_id) or _clean_arg(request_id)
+    effective_key = _clean_arg(blender_key) or _clean_arg(_extract_blender_key(ctx))
+    if not effective_request_id:
+        return (
+            "Missing relay_request_id. Pass the exact relay_request_id from the "
+            "'Blender is still working' message (a long hex string). Wait a few seconds "
+            "and call check_blender_result again with relay_request_id and blender_key set."
+        )
+    if not effective_key:
+        return (
+            "Missing blender_key. Use the exact same blender_key from the original Blender "
+            f"tool call together with relay_request_id='{effective_request_id}'. If you don't "
+            "have the key, ask the user for it, then call check_blender_result again -- do not "
+            "give up, the Blender command is still running."
+        )
+    link = _agent_links.get(effective_key)
+    if link is None:
+        return (
+            "No relay session found for this blender_key yet -- the user's Blender addon may "
+            "not have polled since the command was queued. Wait a few seconds and call "
+            "check_blender_result again with the same relay_request_id and blender_key."
+        )
+
+    stashed = link.results.pop(effective_request_id, None)
     if stashed is not None:
         payload, _stored_at = stashed
         try:
@@ -481,13 +520,18 @@ async def check_blender_result(blender_key: str, relay_request_id: str, user_pro
 
         return json.dumps(result, indent=2)
 
-    if relay_request_id in link.pending:
-        return "Still working -- not ready yet. Wait a few seconds and call check_blender_result again."
+    if effective_request_id in link.pending:
+        return (
+            "Still working -- the Blender addon has the command but hasn't finished it yet. "
+            "Wait a few more seconds and call check_blender_result again with the same "
+            f"relay_request_id='{effective_request_id}' and blender_key='{effective_key}'. "
+            "Do not treat this as a failure."
+        )
 
     return (
-        "Unknown relay_request_id: either it was already retrieved with an earlier "
-        "check_blender_result call, or the addon hasn't picked it up yet -- wait a "
-        "few seconds and try again."
+        "Result not ready yet for this relay_request_id (it may not have been picked up by "
+        "the Blender addon yet, or it was already retrieved). Wait a few seconds and call "
+        "check_blender_result again with the same relay_request_id and blender_key."
     )
 # -----------------------------------------------------------------------------
 
@@ -542,23 +586,53 @@ async def get_blender_connection(ctx=None, blender_key: str = None):
 
 
 _PENDING_RESULT_NOTICE = (
-    "\n\nIMPORTANT: this tool can return a 'still working' response instead of the "
-    "real result, when Blender is reached through the hosted multi-user relay (this "
-    "is common, not a failure). That response includes a relay_request_id and "
-    "blender_key -- relay_request_id is unrelated to any Hyper3D/Rodin task_uuid, "
-    "subscription_key, or request_id, do not confuse them. If you see it, you MUST "
-    "call check_blender_result with those exact relay_request_id/blender_key values, "
-    "and keep calling it every few seconds until it returns the real result -- do not "
-    "stop or tell the user this failed just because of a 'still working' response."
+    "\n\nRELAY POLLING (important): when Blender is reached through the hosted multi-user "
+    "relay, this tool can reply 'Blender is still working' instead of the real result. That "
+    "is normal and NOT a failure. The reply gives you relay_request_id and blender_key "
+    "(relay_request_id is NOT a Hyper3D/Rodin task_uuid, subscription_key, or request_id). "
+    "When that happens you MUST call the check_blender_result tool with those exact "
+    "relay_request_id/blender_key values after ~5 seconds, and keep re-calling it every few "
+    "seconds until it returns the real result. Never report failure just because you got a "
+    "'still working' reply."
 )
 
 
 def _with_pending_notice(func):
-    """Appends relay-pending instructions to a tool's own description, so the
-    model sees them on every call instead of only in a one-off error message."""
+    """Appends relay-pending instructions to a tool's description AND guarantees a
+    pending relay command is returned as plain follow-up text.
+
+    Without this wrapper, each tool's generic `except Exception` would catch
+    BlenderCommandPending and re-prefix it with "Error ...:", which makes models
+    treat a normal slow relay round trip as a hard failure and never call
+    check_blender_result. Catching it here first returns the follow-up
+    instructions verbatim."""
+    import functools as _functools
+    import inspect as _inspect
+
     if func.__doc__:
         func.__doc__ = func.__doc__ + _PENDING_RESULT_NOTICE
-    return func
+
+    if _inspect.iscoroutinefunction(func):
+
+        @_functools.wraps(func)
+        async def _async_wrapper(*args, **kwargs):
+            try:
+                return await func(*args, **kwargs)
+            except BlenderCommandPending as pending:
+                # Plain text, no "Error:" prefix -- the message itself tells the
+                # model to call check_blender_result with the given ids.
+                return str(pending)
+
+        return _async_wrapper
+
+    @_functools.wraps(func)
+    def _sync_wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except BlenderCommandPending as pending:
+            return str(pending)
+
+    return _sync_wrapper
 
 
 @mcp.tool()
@@ -576,6 +650,11 @@ async def get_scene_info(ctx: Context, user_prompt: str, blender_key: str = "") 
 
         # Just return the JSON representation of what Blender sent us
         return json.dumps(result, indent=2)
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error getting scene info from Blender: {str(e)}")
         return f"Error getting scene info: {str(e)}"
@@ -597,6 +676,11 @@ async def get_object_info(ctx: Context, object_name: str, user_prompt: str = "",
         
         # Just return the JSON representation of what Blender sent us
         return json.dumps(result, indent=2)
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error getting object info from Blender: {str(e)}")
         return f"Error getting object info: {str(e)}"
@@ -783,6 +867,11 @@ async def execute_blender_code(ctx: Context, code: str, user_prompt: str = "", b
         blender = await get_blender_connection(ctx, blender_key)
         result = await blender.send_command("execute_code", {"code": code})
         return f"Code executed successfully: {result.get('result', '')}"
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error executing code: {str(e)}")
         return f"Error executing code: {str(e)}"
@@ -819,6 +908,11 @@ async def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user
             formatted_output += f"- {category}: {count} assets\n"
         
         return formatted_output
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error getting Polyhaven categories: {str(e)}")
         return f"Error getting Polyhaven categories: {str(e)}"
@@ -872,6 +966,11 @@ async def search_polyhaven_assets(
             formatted_output += f"  Downloads: {asset_data.get('download_count', 'Unknown')}\n\n"
         
         return formatted_output
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error searching Polyhaven assets: {str(e)}")
         return f"Error searching Polyhaven assets: {str(e)}"
@@ -927,6 +1026,11 @@ async def download_polyhaven_asset(
                 return message
         else:
             return f"Failed to download asset: {result.get('message', 'Unknown error')}"
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error downloading Polyhaven asset: {str(e)}")
         return f"Error downloading Polyhaven asset: {str(e)}"
@@ -987,6 +1091,11 @@ async def set_texture(
             return output
         else:
             return f"Failed to apply texture: {result.get('message', 'Unknown error')}"
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error applying texture: {str(e)}")
         return f"Error applying texture: {str(e)}"
@@ -1007,6 +1116,11 @@ async def get_polyhaven_status(ctx: Context, user_prompt: str = "", blender_key:
         if enabled:
             message += "PolyHaven is good at Textures, and has a wider variety of textures than Sketchfab."
         return message
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error checking PolyHaven status: {str(e)}")
         return f"Error checking PolyHaven status: {str(e)}"
@@ -1027,6 +1141,11 @@ async def get_hyper3d_status(ctx: Context, user_prompt: str = "", blender_key: s
         if enabled:
             message += ""
         return message
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error checking Hyper3D status: {str(e)}")
         return f"Error checking Hyper3D status: {str(e)}"
@@ -1047,6 +1166,11 @@ async def get_sketchfab_status(ctx: Context, user_prompt: str = "", blender_key:
         if enabled:
             message += "Sketchfab is good at Realistic models, and has a wider variety of models than PolyHaven."        
         return message
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error checking Sketchfab status: {str(e)}")
         return f"Error checking Sketchfab status: {str(e)}"
@@ -1122,6 +1246,11 @@ async def search_sketchfab_models(
             formatted_output += f"  Downloadable: {is_downloadable}\n\n"
         
         return formatted_output
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error searching Sketchfab models: {str(e)}")
         import traceback
@@ -1133,14 +1262,14 @@ async def search_sketchfab_models(
 @_with_pending_notice
 async def get_sketchfab_model_preview(
     ctx: Context,
-    uid: str, user_prompt: str = "", blender_key: str = "") -> Image:
+    uid: str, user_prompt: str = "", blender_key: str = ""):
     """
     Get a preview thumbnail of a Sketchfab model by its UID.
     Use this to visually confirm a model before downloading.
-    
+
     Parameters:
     - uid: The unique identifier of the Sketchfab model (obtained from search_sketchfab_models)
-    
+
     Returns the model's thumbnail as an Image for visual confirmation.
     """
     try:
@@ -1166,6 +1295,11 @@ async def get_sketchfab_model_preview(
         
         return Image(data=image_data, format=img_format)
         
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error getting Sketchfab preview: {str(e)}")
         raise Exception(f"Failed to get preview: {str(e)}")
@@ -1239,6 +1373,11 @@ async def download_sketchfab_model(
             return output
         else:
             return f"Failed to download model: {result.get('message', 'Unknown error')}"
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error downloading Sketchfab model: {str(e)}")
         import traceback
@@ -1287,6 +1426,11 @@ async def generate_hyper3d_model_via_text(
             })
         else:
             return json.dumps(result)
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error generating Hyper3D task: {str(e)}")
         return f"Error generating Hyper3D task: {str(e)}"
@@ -1344,6 +1488,11 @@ async def generate_hyper3d_model_via_images(
             })
         else:
             return json.dumps(result)
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error generating Hyper3D task: {str(e)}")
         return f"Error generating Hyper3D task: {str(e)}"
@@ -1389,6 +1538,11 @@ blender_key: str = ""):
             }
         result = await blender.send_command("poll_rodin_job_status", kwargs)
         return result
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error polling Hyper3D job status: {str(e)}")
         return f"Error polling Hyper3D job status: {str(e)}"
@@ -1424,6 +1578,11 @@ blender_key: str = ""):
             kwargs["request_id"] = request_id
         result = await blender.send_command("import_generated_asset", kwargs)
         return result
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error generating Hyper3D task: {str(e)}")
         return f"Error generating Hyper3D task: {str(e)}"
@@ -1440,6 +1599,11 @@ async def get_hunyuan3d_status(ctx: Context, user_prompt: str = "", blender_key:
         result = await blender.send_command("get_hunyuan3d_status")
         message = result.get("message", "")
         return message
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error checking Hunyuan3D status: {str(e)}")
         return f"Error checking Hunyuan3D status: {str(e)}"
@@ -1478,6 +1642,11 @@ async def generate_hunyuan3d_model(
                 "job_id": formatted_job_id,
             })
         return json.dumps(result)
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error generating Hunyuan3D task: {str(e)}")
         return f"Error generating Hunyuan3D task: {str(e)}"
@@ -1508,6 +1677,11 @@ blender_key: str = ""):
         }
         result = await blender.send_command("poll_hunyuan_job_status", kwargs)
         return result
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error generating Hunyuan3D task: {str(e)}")
         return f"Error generating Hunyuan3D task: {str(e)}"
@@ -1538,6 +1712,11 @@ blender_key: str = ""):
             kwargs["zip_file_url"] = zip_file_url
         result = await blender.send_command("import_generated_asset_hunyuan", kwargs)
         return result
+    except BlenderCommandPending as _pending:
+        # Hosted-relay slow path: normal, NOT a failure. Return the follow-up
+        # instructions verbatim (no "Error:" prefix) so the model polls
+        # check_blender_result instead of giving up.
+        return str(_pending)
     except Exception as e:
         logger.error(f"Error generating Hunyuan3D task: {str(e)}")
         return f"Error generating Hunyuan3D task: {str(e)}"
