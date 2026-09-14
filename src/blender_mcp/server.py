@@ -305,6 +305,7 @@ class AgentLink:
         self.command_queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
         self.pending: Dict[str, asyncio.Future] = {}
         self.results: Dict[str, Dict[str, Any]] = {}  # request_id -> (payload, stored_at)
+        self.picked_up: Dict[str, float] = {}  # request_id -> time the addon collected it for execution
         self.last_poll = 0.0
 
     def stash_result(self, request_id: str, payload: Dict[str, Any]):
@@ -342,8 +343,21 @@ async def _send_command_via_agent(key: str, command_type: str, params: Dict[str,
         # actually answers. Popping it here would make check_blender_result
         # wrongly report "unknown request_id" for the entire time between
         # this timeout and the addon's real response.
+        fut = link.pending.get(request_id)
+        if fut is not None and fut.done() and not fut.cancelled():
+            # Answered at the last possible moment -- deliver synchronously.
+            # (A timed-out wait_for may cancel the future itself, in which
+            # case there is nothing to deliver -- fall through to pending.)
+            link.pending.pop(request_id, None)
+            try:
+                return {"__pending__": False, "data": fut.result()}
+            except Exception:
+                pass
         return {"__pending__": True, "request_id": request_id}
 
+    # Won the race: the addon answered in time. Consume the stashed copy (if
+    # any) so a later check_blender_result can't deliver the same result twice.
+    link.results.pop(request_id, None)
     return {"__pending__": False, "data": data}
 
 
@@ -409,6 +423,13 @@ async def internal_blender_agent_poll(blender_key: str) -> dict:
     link.last_poll = time.time()
     try:
         command = await asyncio.wait_for(link.command_queue.get(), timeout=AGENT_POLL_TIMEOUT)
+        # Record that the addon collected this command: lets check_blender_result
+        # tell "addon is executing it" apart from "addon never picked it up".
+        now = time.time()
+        stale = [rid for rid, ts in link.picked_up.items() if now - ts > AGENT_RESULT_TTL]
+        for rid in stale:
+            link.picked_up.pop(rid, None)
+        link.picked_up[command["request_id"]] = now
         return {"command": command}
     except asyncio.TimeoutError:
         return {"command": None}
@@ -430,13 +451,17 @@ async def internal_blender_agent_respond(
     if link is not None:
         payload = {"status": status, "result": result or {}, "message": message}
         future = link.pending.pop(request_id, None)
-        if future and not future.done():
+        link.picked_up.pop(request_id, None)
+        # Always stash: if the original caller already timed out and is now
+        # polling via check_blender_result, this stash is its only way to get
+        # the result. Setting the payload only on the future would silently
+        # drop it whenever that future is already orphaned (nobody awaits it
+        # anymore). The sync path discards the stash when it wins the race,
+        # and check_blender_result pops on read, so results are still normally
+        # delivered exactly once.
+        link.stash_result(request_id, payload)
+        if future is not None and not future.done():
             future.set_result(payload)
-        else:
-            # The original tool call already gave up waiting (it only waits
-            # RELAY_SYNC_BUDGET seconds) -- stash it so check_blender_result
-            # can still retrieve it once it's asked for.
-            link.stash_result(request_id, payload)
     return {"ok": True}
 
 
@@ -521,10 +546,21 @@ async def check_blender_result(
         return json.dumps(result, indent=2)
 
     if effective_request_id in link.pending:
+        if effective_request_id in link.picked_up:
+            ago = int(time.time() - link.picked_up[effective_request_id])
+            return (
+                "Still working -- the Blender addon picked up this command "
+                f"~{ago}s ago and is still executing it. Wait a few more seconds and call "
+                "check_blender_result again with the same "
+                f"relay_request_id='{effective_request_id}' and blender_key='{effective_key}'. "
+                "Do not treat this as a failure."
+            )
         return (
-            "Still working -- the Blender addon has the command but hasn't finished it yet. "
-            "Wait a few more seconds and call check_blender_result again with the same "
-            f"relay_request_id='{effective_request_id}' and blender_key='{effective_key}'. "
+            "Still working -- this command is still queued: the Blender addon hasn't picked "
+            "it up yet. Wait a few more seconds and call check_blender_result again with the "
+            f"same relay_request_id='{effective_request_id}' and blender_key='{effective_key}'. "
+            "If this persists, the user's Blender is not connected: Blender must be open, its "
+            "BlenderMCP relay connected to this same server, and the key must match exactly. "
             "Do not treat this as a failure."
         )
 
