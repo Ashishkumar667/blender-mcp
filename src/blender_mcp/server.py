@@ -417,6 +417,7 @@ async def debug_relay_status(blender_key: str) -> dict:
         return {
             "registered": False,
             "message": "No addon has ever polled under this blender_key on this server process.",
+            "server_process_id": os.getpid(),
         }
     seconds_since_last_poll = round(time.time() - link.last_poll, 1) if link.last_poll else None
     return {
@@ -424,6 +425,7 @@ async def debug_relay_status(blender_key: str) -> dict:
         "seconds_since_last_poll": seconds_since_last_poll,
         "queued_commands_waiting_for_pickup": link.command_queue.qsize(),
         "commands_currently_in_flight": len(link.pending),
+        "server_process_id": os.getpid(),
     }
 # -----------------------------------------------------------------------------
 
@@ -444,20 +446,10 @@ async def get_blender_connection(ctx=None, blender_key: str = None):
     if key:
         return RelayBlenderConnection(key)
 
-    if MCP_TRANSPORT != "stdio":
-        # Hosted/networked mode: there is no single local Blender to fall back
-        # to here (this server is shared by many users), so a missing key is
-        # never actually "connect to the addon on this machine" -- it's the
-        # model forgetting to supply blender_key. Say so plainly instead of
-        # attempting BLENDER_HOST/BLENDER_PORT and failing with a confusing
-        # "connection closed" message that doesn't explain why.
-        raise Exception(
-            "No blender_key was given with this tool call. This server is shared by multiple "
-            "users, each with their own Blender. Ask the user for their personal Blender key, "
-            "then include it as the blender_key argument on this and every subsequent Blender "
-            "tool call in this conversation."
-        )
-
+    # No blender_key: fall back to a single, direct BLENDER_HOST/BLENDER_PORT
+    # connection -- the original design, suitable when Blender itself runs as
+    # one persistent, network-reachable host (not on an individual user's
+    # personal machine, which is what the blender_key/relay path above is for).
     global _blender_connection, _polyhaven_enabled  # Add _polyhaven_enabled to globals
 
     # If we have an existing connection, check if it's still valid
@@ -1451,12 +1443,11 @@ def asset_creation_strategy() -> str:
     """Defines the preferred strategy for creating assets in Blender"""
     return """When creating 3D content in Blender, always start by checking if integrations are available:
 
-    **blender_key**: Every Blender tool takes a blender_key parameter identifying which
-    user's Blender to control (this server can be shared by many users, each with their
-    own Blender running locally). If you don't already have this user's key from earlier
-    in the conversation, ask them for it before calling any other Blender tool -- then
-    reuse that exact same value for every Blender tool call for the rest of this
-    conversation. Never guess or reuse a key from a different conversation/user.
+    **blender_key**: Every Blender tool accepts an optional blender_key parameter. Leave
+    it empty/unset by default -- this server is currently configured to control one single,
+    shared Blender directly, so no key is needed. Only ask the user for a personal key and
+    include it if they explicitly give you one themselves; never ask for one unprompted,
+    and never guess one.
 
     **Never call internal_blender_agent_poll or internal_blender_agent_respond.** Those
     two tools are plumbing the Blender addon itself uses behind the scenes and are never
