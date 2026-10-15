@@ -2522,9 +2522,20 @@ class BlenderMCPHostedRelay:
     # the server with its own timeout well under a minute. These are kept
     # with generous margin under that so a slow network hiccup shows up as a
     # clean retry instead of a client-side read timeout.
+    #
+    # These MUST stay properly nested, each comfortably larger than the one
+    # below it, or a shorter outer timeout gives up while a longer inner one
+    # (e.g. a command's own requests.get/post call) is still running on
+    # Blender's main thread -- which then blocks every other command behind
+    # it too. on-demand.io confirmed their gateway timeout is 2 minutes, so
+    # every requests call in this file now uses timeout=(10, 60) (70s worst
+    # case) to give real but slow operations (e.g. a larger asset download)
+    # much more room, while MAIN_THREAD_TIMEOUT clears that with margin, and
+    # the server's own RELAY_RESPONSE_TIMEOUT (100s, in server.py) clears
+    # MAIN_THREAD_TIMEOUT + RESPOND_TIMEOUT with margin in turn.
     POLL_TIMEOUT = 40  # server itself only waits ~15s (AGENT_POLL_TIMEOUT); this is margin for network/gateway overhead
-    RESPOND_TIMEOUT = 20
-    MAIN_THREAD_TIMEOUT = 30  # server gives up waiting for a response after ~45s (AGENT_RESPONSE_TIMEOUT); stay under that
+    RESPOND_TIMEOUT = 15
+    MAIN_THREAD_TIMEOUT = 80  # comfortably above the 70s worst case of any single requests call above
     RETRY_DELAY = 5
 
     def __init__(self, server, mcp_url, key):

@@ -264,12 +264,15 @@ _agent_links_guard = threading.Lock()
 
 AGENT_POLL_TIMEOUT = 15.0  # how long internal_blender_agent_poll waits before returning "no command"
 
-# Hosted platforms commonly put their own gateway timeout (e.g. an nginx/APISIX
-# reverse proxy) in front of a single request. Real (bug-free) round trips
-# measured so far top out around 27s even for a screenshot (the heaviest
-# payload), well under every observed gateway cutoff (~55s+), so this leaves
-# solid margin while still answering in one shot.
-RELAY_RESPONSE_TIMEOUT = 55.0
+# Hosted platforms commonly put their own gateway timeout in front of a
+# single request -- on-demand.io confirmed theirs is 2 minutes (120s). Kept
+# comfortably under that so a slow-but-real response (e.g. a larger asset
+# download) has much more room than before, while still finishing well
+# before the gateway would cut the connection. Must also clear addon.py's
+# own worst case (MAIN_THREAD_TIMEOUT 80s + RESPOND_TIMEOUT 15s = 95s) with
+# a few seconds to spare -- see the timeout comment on BlenderMCPHostedRelay
+# in addon.py for how that chain is kept properly nested.
+RELAY_RESPONSE_TIMEOUT = 100.0
 
 # on-demand.io's gateway rejects large request bodies outright with a 413,
 # confirmed with a 1200px screenshot's base64 PNG data. A viewport screenshot
@@ -401,6 +404,27 @@ async def internal_blender_agent_respond(
         # result is simply discarded -- there's no follow-up mechanism to
         # hand it to anymore.
     return {"ok": True}
+
+
+@mcp.tool()
+async def debug_relay_status(blender_key: str) -> dict:
+    """DIAGNOSTIC TOOL, not for normal use. Reports whether a Blender addon has
+    ever registered with this server under the given blender_key, and how
+    recently it last checked in. Use this to tell apart "the addon isn't
+    actually connected" from "it's connected but a command is stuck"."""
+    link = _agent_links.get(blender_key)
+    if link is None:
+        return {
+            "registered": False,
+            "message": "No addon has ever polled under this blender_key on this server process.",
+        }
+    seconds_since_last_poll = round(time.time() - link.last_poll, 1) if link.last_poll else None
+    return {
+        "registered": True,
+        "seconds_since_last_poll": seconds_since_last_poll,
+        "queued_commands_waiting_for_pickup": link.command_queue.qsize(),
+        "commands_currently_in_flight": len(link.pending),
+    }
 # -----------------------------------------------------------------------------
 
 
@@ -419,6 +443,20 @@ async def get_blender_connection(ctx=None, blender_key: str = None):
     key = blender_key or _extract_blender_key(ctx)
     if key:
         return RelayBlenderConnection(key)
+
+    if MCP_TRANSPORT != "stdio":
+        # Hosted/networked mode: there is no single local Blender to fall back
+        # to here (this server is shared by many users), so a missing key is
+        # never actually "connect to the addon on this machine" -- it's the
+        # model forgetting to supply blender_key. Say so plainly instead of
+        # attempting BLENDER_HOST/BLENDER_PORT and failing with a confusing
+        # "connection closed" message that doesn't explain why.
+        raise Exception(
+            "No blender_key was given with this tool call. This server is shared by multiple "
+            "users, each with their own Blender. Ask the user for their personal Blender key, "
+            "then include it as the blender_key argument on this and every subsequent Blender "
+            "tool call in this conversation."
+        )
 
     global _blender_connection, _polyhaven_enabled  # Add _polyhaven_enabled to globals
 
