@@ -2531,10 +2531,17 @@ class BlenderMCPHostedRelay:
     # every requests call in this file now uses timeout=(10, 60) (70s worst
     # case) to give real but slow operations (e.g. a larger asset download)
     # much more room, while MAIN_THREAD_TIMEOUT clears that with margin, and
-    # the server's own RELAY_RESPONSE_TIMEOUT (100s, in server.py) clears
+    # the server's own RELAY_RESPONSE_TIMEOUT (115s, in server.py) clears
     # MAIN_THREAD_TIMEOUT + RESPOND_TIMEOUT with margin in turn.
+    #
+    # RESPOND_TIMEOUT was confirmed too short (15s): real tests showed
+    # Blender executing a command INSTANTLY, but the result never reaching
+    # the server -- i.e. this specific POST call (sending the result back)
+    # was itself timing out against on-demand.io's gateway and failing
+    # silently (caught, printed locally, never surfaced). Given 25s each way,
+    # that's exactly plausible for a slower round trip on their platform.
     POLL_TIMEOUT = 40  # server itself only waits ~15s (AGENT_POLL_TIMEOUT); this is margin for network/gateway overhead
-    RESPOND_TIMEOUT = 15
+    RESPOND_TIMEOUT = 25
     MAIN_THREAD_TIMEOUT = 80  # comfortably above the 70s worst case of any single requests call above
     RETRY_DELAY = 5
 

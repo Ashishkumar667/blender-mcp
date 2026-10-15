@@ -269,10 +269,10 @@ AGENT_POLL_TIMEOUT = 15.0  # how long internal_blender_agent_poll waits before r
 # comfortably under that so a slow-but-real response (e.g. a larger asset
 # download) has much more room than before, while still finishing well
 # before the gateway would cut the connection. Must also clear addon.py's
-# own worst case (MAIN_THREAD_TIMEOUT 80s + RESPOND_TIMEOUT 15s = 95s) with
+# own worst case (MAIN_THREAD_TIMEOUT 80s + RESPOND_TIMEOUT 25s = 105s) with
 # a few seconds to spare -- see the timeout comment on BlenderMCPHostedRelay
 # in addon.py for how that chain is kept properly nested.
-RELAY_RESPONSE_TIMEOUT = 100.0
+RELAY_RESPONSE_TIMEOUT = 115.0
 
 # on-demand.io's gateway rejects large request bodies outright with a 413,
 # confirmed with a 1200px screenshot's base64 PNG data. A viewport screenshot
