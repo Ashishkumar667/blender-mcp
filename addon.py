@@ -574,7 +574,7 @@ class BlenderMCPServer:
             if asset_type not in ["hdris", "textures", "models", "all"]:
                 return {"error": f"Invalid asset type: {asset_type}. Must be one of: hdris, textures, models, all"}
 
-            response = requests.get(f"https://api.polyhaven.com/categories/{asset_type}", headers=REQ_HEADERS)
+            response = requests.get(f"https://api.polyhaven.com/categories/{asset_type}", headers=REQ_HEADERS, timeout=(10, 60))
             if response.status_code == 200:
                 return {"categories": response.json()}
             else:
@@ -596,7 +596,7 @@ class BlenderMCPServer:
             if categories:
                 params["categories"] = categories
 
-            response = requests.get(url, params=params, headers=REQ_HEADERS)
+            response = requests.get(url, params=params, headers=REQ_HEADERS, timeout=(10, 60))
             if response.status_code == 200:
                 # Limit the response size to avoid overwhelming Blender
                 assets = response.json()
@@ -616,7 +616,7 @@ class BlenderMCPServer:
     def download_polyhaven_asset(self, asset_id, asset_type, resolution="1k", file_format=None):
         try:
             # First get the files information
-            files_response = requests.get(f"https://api.polyhaven.com/files/{asset_id}", headers=REQ_HEADERS)
+            files_response = requests.get(f"https://api.polyhaven.com/files/{asset_id}", headers=REQ_HEADERS, timeout=(10, 60))
             if files_response.status_code != 200:
                 return {"error": f"Failed to get asset files: {files_response.status_code}"}
 
@@ -636,7 +636,7 @@ class BlenderMCPServer:
                     # since Blender can't properly load HDR data directly from memory
                     with tempfile.NamedTemporaryFile(suffix=f".{file_format}", delete=False) as tmp_file:
                         # Download the file
-                        response = requests.get(file_url, headers=REQ_HEADERS)
+                        response = requests.get(file_url, headers=REQ_HEADERS, timeout=(10, 60))
                         if response.status_code != 200:
                             return {"error": f"Failed to download HDRI: {response.status_code}"}
 
@@ -732,7 +732,7 @@ class BlenderMCPServer:
                                 # Use NamedTemporaryFile like we do for HDRIs
                                 with tempfile.NamedTemporaryFile(suffix=f".{file_format}", delete=False) as tmp_file:
                                     # Download the file
-                                    response = requests.get(file_url, headers=REQ_HEADERS)
+                                    response = requests.get(file_url, headers=REQ_HEADERS, timeout=(10, 60))
                                     if response.status_code == 200:
                                         tmp_file.write(response.content)
                                         tmp_path = tmp_file.name
@@ -869,7 +869,7 @@ class BlenderMCPServer:
                         main_file_name = file_url.split("/")[-1]
                         main_file_path = os.path.join(temp_dir, main_file_name)
 
-                        response = requests.get(file_url, headers=REQ_HEADERS)
+                        response = requests.get(file_url, headers=REQ_HEADERS, timeout=(10, 60))
                         if response.status_code != 200:
                             return {"error": f"Failed to download model: {response.status_code}"}
 
@@ -901,7 +901,7 @@ class BlenderMCPServer:
                                 os.makedirs(os.path.dirname(include_file_path), exist_ok=True)
 
                                 # Download the included file
-                                include_response = requests.get(include_url, headers=REQ_HEADERS)
+                                include_response = requests.get(include_url, headers=REQ_HEADERS, timeout=(10, 60))
                                 if include_response.status_code == 200:
                                     with open(include_file_path, "wb") as f:
                                         f.write(include_response.content)
@@ -1366,7 +1366,7 @@ class BlenderMCPServer:
                     "Authorization": f"Bearer {api_key}",
                 },
                 files=files
-            )
+            , timeout=(10, 60))
             data = response.json()
             return data
         except Exception as e:
@@ -1398,7 +1398,7 @@ class BlenderMCPServer:
                     "Content-Type": "application/json",
                 },
                 json=req_data
-            )
+            , timeout=(10, 60))
             data = response.json()
             return data
         except Exception as e:
@@ -1426,7 +1426,7 @@ class BlenderMCPServer:
             json={
                 "subscription_key": subscription_key,
             },
-        )
+        timeout=(10, 60))
         data = response.json()
         return {
             "status_list": [i["status"] for i in data["jobs"]]
@@ -1442,7 +1442,7 @@ class BlenderMCPServer:
             headers={
                 "Authorization": f"KEY {api_key}",
             },
-        )
+        timeout=(10, 60))
         data = response.json()
         return data
 
@@ -1535,7 +1535,7 @@ class BlenderMCPServer:
             json={
                 'task_uuid': task_uuid
             }
-        )
+        , timeout=(10, 60))
         data_ = response.json()
         temp_file = None
         for i in data_["list"]:
@@ -1548,7 +1548,7 @@ class BlenderMCPServer:
 
                 try:
                     # Download the content
-                    response = requests.get(i["url"], stream=True)
+                    response = requests.get(i["url"], stream=True, timeout=(10, 60))
                     response.raise_for_status()  # Raise an exception for HTTP errors
 
                     # Write the content to the temporary file
@@ -1601,7 +1601,7 @@ class BlenderMCPServer:
             headers={
                 "Authorization": f"Key {api_key}",
             }
-        )
+        , timeout=(10, 60))
         data_ = response.json()
         temp_file = None
 
@@ -1613,7 +1613,7 @@ class BlenderMCPServer:
 
         try:
             # Download the content
-            response = requests.get(data_["model_mesh"]["url"], stream=True)
+            response = requests.get(data_["model_mesh"]["url"], stream=True, timeout=(10, 60))
             response.raise_for_status()  # Raise an exception for HTTP errors
 
             # Write the content to the temporary file
@@ -2288,7 +2288,7 @@ class BlenderMCPServer:
                 endpoint,
                 headers = headers,
                 data = json.dumps(data)
-            )
+            , timeout=(10, 60))
 
             if response.status_code == 200:
                 return response.json()
@@ -2331,7 +2331,7 @@ class BlenderMCPServer:
             if image:
                 if re.match(r'^https?://', image, re.IGNORECASE) is not None:
                     try:
-                        resImg = requests.get(image)
+                        resImg = requests.get(image, timeout=(10, 60))
                         resImg.raise_for_status()
                         image_base64 = base64.b64encode(resImg.content).decode("ascii")
                         data["image"] = image_base64
@@ -2349,7 +2349,7 @@ class BlenderMCPServer:
             response = requests.post(
                 f"{base_url}/generate",
                 json = data,
-            )
+            timeout=(10, 60))
 
             if response.status_code != 200:
                 return {
@@ -2415,7 +2415,7 @@ class BlenderMCPServer:
                 endpoint,
                 headers=headers,
                 data=json.dumps(data)
-            )
+            , timeout=(10, 60))
 
             if response.status_code == 200:
                 return response.json()
@@ -2444,7 +2444,7 @@ class BlenderMCPServer:
 
         try:
             # Download ZIP file
-            zip_response = requests.get(zip_file_url, stream=True)
+            zip_response = requests.get(zip_file_url, stream=True, timeout=(10, 60))
             zip_response.raise_for_status()
             with open(zip_file_path, "wb") as f:
                 for chunk in zip_response.iter_content(chunk_size=8192):
