@@ -2909,6 +2909,24 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
     def execute(self, context):
         scene = context.scene
 
+        # Re-check env-var-driven integration defaults here too, not just at
+        # addon registration -- a second guarantee in case anything about
+        # scene/file-load timing kept the startup check from sticking. Same
+        # checks as in register(): only ever turns something ON when its key
+        # is present and the box isn't already checked, never OFF.
+        if not scene.blendermcp_use_hyper3d and os.getenv("BLENDERMCP_HYPER3D_API_KEY"):
+            scene.blendermcp_use_hyper3d = True
+        hyper3d_mode_env = os.getenv("BLENDERMCP_HYPER3D_MODE", "").strip().upper()
+        if hyper3d_mode_env in ("MAIN_SITE", "FAL_AI"):
+            scene.blendermcp_hyper3d_mode = hyper3d_mode_env
+        if not scene.blendermcp_use_sketchfab and os.getenv("BLENDERMCP_SKETCHFAB_API_KEY"):
+            scene.blendermcp_use_sketchfab = True
+        if not scene.blendermcp_use_hunyuan3d and (
+            (os.getenv("BLENDERMCP_HUNYUAN3D_SECRET_ID") and os.getenv("BLENDERMCP_HUNYUAN3D_SECRET_KEY"))
+            or os.getenv("BLENDERMCP_HUNYUAN3D_API_URL")
+        ):
+            scene.blendermcp_use_hunyuan3d = True
+
         # Create a new server instance
         if not hasattr(bpy.types, "blendermcp_server") or not bpy.types.blendermcp_server:
             bpy.types.blendermcp_server = BlenderMCPServer(port=scene.blendermcp_port)
