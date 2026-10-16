@@ -3169,6 +3169,30 @@ def register():
         port = 9876
         auto_start = True
 
+    # If an integration's API key/credentials are already provided via
+    # environment variable (e.g. set once by whoever deploys this, for every
+    # user of a shared hosted Blender) but the user hasn't touched its
+    # checkbox, turn the integration on automatically instead of requiring
+    # each user to manually enable it -- the key being present is already a
+    # clear signal it's meant to be used.
+    if scene is not None:
+        if not scene.blendermcp_use_hyper3d and os.getenv("BLENDERMCP_HYPER3D_API_KEY"):
+            scene.blendermcp_use_hyper3d = True
+        # Hyper3D's API key field is shared by both hyper3d.ai (MAIN_SITE) and
+        # fal.ai (FAL_AI) -- they're different APIs expecting different key
+        # formats, so if the key is meant for fal.ai, this also needs to be
+        # set so the right endpoint actually gets called.
+        hyper3d_mode_env = os.getenv("BLENDERMCP_HYPER3D_MODE", "").strip().upper()
+        if hyper3d_mode_env in ("MAIN_SITE", "FAL_AI"):
+            scene.blendermcp_hyper3d_mode = hyper3d_mode_env
+        if not scene.blendermcp_use_sketchfab and os.getenv("BLENDERMCP_SKETCHFAB_API_KEY"):
+            scene.blendermcp_use_sketchfab = True
+        if not scene.blendermcp_use_hunyuan3d and (
+            (os.getenv("BLENDERMCP_HUNYUAN3D_SECRET_ID") and os.getenv("BLENDERMCP_HUNYUAN3D_SECRET_KEY"))
+            or os.getenv("BLENDERMCP_HUNYUAN3D_API_URL")
+        ):
+            scene.blendermcp_use_hunyuan3d = True
+
     if auto_start and (not hasattr(bpy.types, "blendermcp_server") or not bpy.types.blendermcp_server):
         bpy.types.blendermcp_server = BlenderMCPServer(port=port)
     if auto_start and not bpy.types.blendermcp_server.running:
