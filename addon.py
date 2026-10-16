@@ -19,6 +19,7 @@ from datetime import datetime
 import hashlib, hmac, base64
 import os.path as osp
 from contextlib import redirect_stdout, suppress
+from urllib.parse import urlparse
 
 bl_info = {
     "name": "Blender MCP",
@@ -1343,12 +1344,25 @@ class BlenderMCPServer:
                 return {"error": "Hyper3D API key is not given"}
             if images is None:
                 images = []
-            if any(not isinstance(img, (tuple, list)) or len(img) != 2 for img in images):
-                return {
-                    "error": "MAIN_SITE mode requires input_image_paths (uploaded file bytes), "
-                             "not input_image_urls. Switch Hyper3D Rodin's mode to FAL_AI in the "
-                             "BlenderMCP panel to use image URLs, or pass input_image_paths instead."
-                }
+            # input_image_paths arrives here as (suffix, base64_data) tuples already;
+            # input_image_urls arrives as plain URL strings -- download and convert
+            # those to the same tuple format instead of rejecting them.
+            resolved_images = []
+            for img in images:
+                if isinstance(img, (tuple, list)) and len(img) == 2:
+                    resolved_images.append(tuple(img))
+                    continue
+                if isinstance(img, str) and re.match(r'^https?://', img, re.IGNORECASE):
+                    try:
+                        img_resp = requests.get(img, timeout=(10, 60))
+                        img_resp.raise_for_status()
+                        suffix = os.path.splitext(urlparse(img).path)[1] or ".png"
+                        resolved_images.append((suffix, base64.b64encode(img_resp.content).decode("ascii")))
+                    except Exception as e:
+                        return {"error": f"Failed to download image from URL: {str(e)}"}
+                else:
+                    return {"error": f"Unrecognized image entry: {img!r}"}
+            images = resolved_images
             """Call Rodin API, get the job uuid and subscription key"""
             files = [
                 *[("images", (f"{i:04d}{img_suffix}", base64.b64decode(img) if isinstance(img, str) else img)) for i, (img_suffix, img) in enumerate(images)],
@@ -1413,8 +1427,14 @@ class BlenderMCPServer:
             case _:
                 return f"Error: Unknown Hyper3D Rodin mode!"
 
-    def poll_rodin_job_status_main_site(self, subscription_key: str):
+    def poll_rodin_job_status_main_site(self, subscription_key: str = None):
         """Call the job status API to get the job status"""
+        if not subscription_key:
+            return {
+                "error": "subscription_key is required for MAIN_SITE mode (given by the "
+                "generate_hyper3d_model_via_text/images step). If that earlier step failed, "
+                "there is no job to poll -- fix and retry the generation step first."
+            }
         api_key = self._get_hyper3d_api_key()
         if not api_key:
             return {"error": "Hyper3D API key is not given"}
@@ -1522,8 +1542,15 @@ class BlenderMCPServer:
             case _:
                 return f"Error: Unknown Hyper3D Rodin mode!"
 
-    def import_generated_asset_main_site(self, task_uuid: str, name: str):
+    def import_generated_asset_main_site(self, name: str, task_uuid: str = None):
         """Fetch the generated asset, import into blender"""
+        if not task_uuid:
+            return {
+                "succeed": False,
+                "error": "task_uuid is required for MAIN_SITE mode (given by the "
+                "generate_hyper3d_model_via_text/images step). If that earlier step failed, "
+                "there is no job to import -- fix and retry the generation step first.",
+            }
         api_key = self._get_hyper3d_api_key()
         if not api_key:
             return {"succeed": False, "error": "Hyper3D API key is not given"}
@@ -1603,6 +1630,13 @@ class BlenderMCPServer:
             }
         , timeout=(10, 60))
         data_ = response.json()
+        if "model_mesh" not in data_:
+            return {
+                "succeed": False,
+                "error": "The generation job isn't finished yet (no model_mesh in the response). "
+                "Call poll_rodin_job_status with this same request_id until it reports COMPLETED, "
+                "then call import_generated_asset again.",
+            }
         temp_file = None
 
         temp_file = tempfile.NamedTemporaryFile(
